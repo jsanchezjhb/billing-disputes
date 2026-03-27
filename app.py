@@ -760,15 +760,14 @@ app.layout = html.Div([
         dcc.Download(id="dl-4"),
         dcc.Download(id="dl-5"),
         dcc.Store(id="pdf-store", storage_type="memory"),
+        # Buttons must exist in layout at startup for Dash to register their callbacks
+        html.Button(id="dl-btn-1", n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-2", n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-3", n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-4", n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-5", n_clicks=0, style={"display":"none"}),
 
-        # Hidden buttons pre-declared so Dash registers callbacks at startup
-        html.Div([
-            html.Button(id="dl-btn-1", n_clicks=0),
-            html.Button(id="dl-btn-2", n_clicks=0),
-            html.Button(id="dl-btn-3", n_clicks=0),
-            html.Button(id="dl-btn-4", n_clicks=0),
-            html.Button(id="dl-btn-5", n_clicks=0),
-        ], style={"display":"none"}),
+
 
     ], style={"maxWidth":"580px","margin":"0 auto","background":"#fff",
               "border":"1px solid #e5e7eb","borderRadius":"16px","padding":"32px"}),
@@ -795,30 +794,42 @@ def on_generate(n_clicks, dispute_id):
         import base64
         store = {fn: base64.b64encode(data).decode() for fn, data in pdfs.items()}
 
-        buttons = []
+        # Show download buttons using the pre-declared IDs in the layout
+        rows = []
         for i, (fn, (label, cat)) in enumerate(zip(filenames, STRIPE_UPLOAD_CATEGORIES)):
-            buttons.append(html.Div([
+            rows.append(html.Div([
                 html.Div([
                     html.Span(str(i+1) + ". " + label,
                               style={"fontSize":"13px","fontWeight":"600","color":"#111827"}),
                     html.Span(" - upload as: ", style={"fontSize":"12px","color":"#9ca3af"}),
                     html.Code(cat, style={"fontSize":"11px","background":"#eff6ff",
                                          "color":"#4f46e5","padding":"1px 6px","borderRadius":"4px"}),
-                ], style={"marginBottom":"8px"}),
-                html.Button("Download", id="dl-btn-" + str(i+1), n_clicks=0,
-                            style={"background":"#f8fafc","border":"1px solid #e2e8f0",
-                                   "borderRadius":"6px","padding":"6px 14px",
-                                   "fontSize":"12px","cursor":"pointer"}),
+                ], style={"marginBottom":"6px"}),
+                html.Div(fn, style={"fontSize":"11px","color":"#9ca3af","fontFamily":"monospace","marginBottom":"6px"}),
             ], style={"background":"#fff","border":"1px solid #e5e7eb","borderRadius":"10px",
-                      "padding":"14px 16px","marginBottom":"10px"}))
+                      "padding":"12px 16px","marginBottom":"8px"}))
+
+        # Show the 5 download buttons (pre-declared in layout, now made visible)
+        dl_buttons = html.Div([
+            html.Div("Click to download each PDF:", style={"fontSize":"12px","color":"#6b7280","marginBottom":"8px"}),
+            html.Div([
+                html.Button(str(i+1) + ". " + STRIPE_UPLOAD_CATEGORIES[i][0],
+                           id="dl-btn-" + str(i+1), n_clicks=0,
+                           style={"display":"block","width":"100%","textAlign":"left",
+                                  "padding":"10px 14px","marginBottom":"6px",
+                                  "background":"#f8fafc","border":"1px solid #e2e8f0",
+                                  "borderRadius":"8px","fontSize":"13px","cursor":"pointer"})
+                for i in range(5)
+            ]),
+        ])
 
         status = html.Div([
             html.Span("Package ready - ", style={"color":"#16a34a","fontWeight":"700"}),
             html.Span(dispute_id.strip(), style={"color":"#065f46","fontSize":"13px"}),
         ], style={"background":"#f0fdf4","border":"1px solid #a7f3d0",
-                  "borderRadius":"8px","padding":"10px 14px"})
+                  "borderRadius":"8px","padding":"10px 14px","marginBottom":"12px"})
 
-        return status, buttons, store
+        return status, [status] + rows + [dl_buttons], store
 
     except Exception as e:
         return (
