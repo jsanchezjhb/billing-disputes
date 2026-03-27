@@ -113,34 +113,64 @@ def get_dispute(dispute_id):
         pass
     return row
 
-def get_invoice(customer_email, customer_id=None):
-    """Fetch the most recent paid invoice for this customer from stripe.invoice."""
-    rows = run_query(
-        "SELECT id, number, status, amount_paid, amount_due, total, "
-        "currency, period_start, period_end, billing_reason, "
-        "customer_name, customer_email, subscription, charge, "
-        "receipt_number, hosted_invoice_url, created, paid "
-        "FROM " + INVOICE_TABLE + " "
-        "WHERE LOWER(customer_email) = LOWER(:email) "
-        "AND paid = 'true' "
-        "ORDER BY created DESC LIMIT 10",
-        {"email": customer_email},
-    )
-    if not rows:
-        # Fallback: try by customer_id
-        if customer_id:
-            rows = run_query(
-                "SELECT id, number, status, amount_paid, amount_due, total, "
-                "currency, period_start, period_end, billing_reason, "
-                "customer_name, customer_email, subscription, charge, "
-                "receipt_number, hosted_invoice_url, created, paid "
-                "FROM " + INVOICE_TABLE + " "
-                "WHERE customer = :cid "
-                "AND paid = 'true' "
-                "ORDER BY created DESC LIMIT 10",
-                {"cid": customer_id},
-            )
-    return rows or []
+def get_invoice(customer_email, customer_id=None, dispute_amount=None):
+    """Fetch the specific invoice matching this dispute by customer + amount."""
+    # dispute_amount is already formatted as "$126.48" - convert back to cents string
+    amount_cents = None
+    if dispute_amount:
+        try:
+            amount_cents = str(int(round(float(dispute_amount.replace("$","")) * 100)))
+        except (ValueError, AttributeError):
+            pass
+
+    # Primary: match by customer_id + amount
+    if customer_id and amount_cents:
+        rows = run_query(
+            "SELECT id, number, status, amount_paid, amount_due, total, "
+            "currency, period_start, period_end, billing_reason, "
+            "customer_name, customer_email, subscription, charge, "
+            "receipt_number, hosted_invoice_url, created, paid "
+            "FROM " + INVOICE_TABLE + " "
+            "WHERE customer = :cid "
+            "AND amount_paid = :amt "
+            "ORDER BY created DESC LIMIT 1",
+            {"cid": customer_id, "amt": amount_cents},
+        )
+        if rows:
+            return rows[0]
+
+    # Fallback: match by email + amount
+    if amount_cents:
+        rows = run_query(
+            "SELECT id, number, status, amount_paid, amount_due, total, "
+            "currency, period_start, period_end, billing_reason, "
+            "customer_name, customer_email, subscription, charge, "
+            "receipt_number, hosted_invoice_url, created, paid "
+            "FROM " + INVOICE_TABLE + " "
+            "WHERE LOWER(customer_email) = LOWER(:email) "
+            "AND amount_paid = :amt "
+            "ORDER BY created DESC LIMIT 1",
+            {"email": customer_email, "amt": amount_cents},
+        )
+        if rows:
+            return rows[0]
+
+    # Last resort: most recent paid invoice for this customer
+    if customer_id:
+        rows = run_query(
+            "SELECT id, number, status, amount_paid, amount_due, total, "
+            "currency, period_start, period_end, billing_reason, "
+            "customer_name, customer_email, subscription, charge, "
+            "receipt_number, hosted_invoice_url, created, paid "
+            "FROM " + INVOICE_TABLE + " "
+            "WHERE customer = :cid AND paid = 'true' "
+            "ORDER BY created DESC LIMIT 1",
+            {"cid": customer_id},
+        )
+        if rows:
+            return rows[0]
+
+    return None
 
 def get_account(customer_email):
     users = run_query(
@@ -563,35 +593,42 @@ def pdf_receipt(dispute, invoices=None):
     ]))
     s.append(Spacer(1,18))
 
-    # Invoice receipts
-    s.append(sh("Billing History & Receipts"))
-    if invoices:
-        for inv in invoices:
-            s.append(Spacer(1,6))
-            inv_num = inv.get("number") or inv.get("id","--")
-            s.append(Paragraph("<b>Invoice " + inv_num + "</b>",
-                ParagraphStyle("ih", fontName="Helvetica-Bold", fontSize=10, textColor=DARK, spaceAfter=6)))
-            s.append(kv_table([
-                ("Invoice Number",  inv.get("number","--")),
-                ("Status",          (inv.get("status") or "--").title()),
-                ("Billing Reason",  (inv.get("billing_reason") or "--").replace("_"," ").title()),
-                ("Amount Due",      fmt_amount(inv.get("amount_due"))),
-                ("Amount Paid",     fmt_amount(inv.get("amount_paid"))),
-                ("Currency",        (inv.get("currency") or "usd").upper()),
-                ("Service Period",  fmt(inv.get("period_start")) + " to " + fmt(inv.get("period_end"))),
-                ("Invoice Date",    fmt(inv.get("created"))),
-                ("Receipt Number",  inv.get("receipt_number") or "--"),
-                ("Subscription ID", inv.get("subscription","--")),
-                ("Charge ID",       inv.get("charge","--")),
-            ]))
-            if inv.get("hosted_invoice_url"):
-                s.append(Spacer(1,4))
-                s.append(bp("Invoice URL: " + inv.get("hosted_invoice_url")))
-            s.append(Spacer(1,10))
-            s.append(HRFlowable(width="100%", thickness=0.5, color=GRAY_BDR))
+    # Invoice receipt for this specific dispute
+    s.append(sh("Invoice Receipt"))
+    inv = invoices  # single invoice dict or None
+    if inv:
+        # Convert unix timestamps to readable dates for period
+        def ts_to_date(val):
+            if not val or val == "--":
+                return "--"
+            try:
+                from datetime import datetime, timezone
+                return datetime.fromtimestamp(int(val), tz=timezone.utc).strftime("%Y-%m-%d")
+            except (ValueError, TypeError):
+                return str(val)[:10]
+
+        s.append(kv_table([
+            ("Invoice Number",  inv.get("number","--")),
+            ("Invoice ID",      inv.get("id","--")),
+            ("Status",          (inv.get("status") or "--").title()),
+            ("Billing Reason",  (inv.get("billing_reason") or "--").replace("_"," ").title()),
+            ("Amount Due",      fmt_amount(inv.get("amount_due"))),
+            ("Amount Paid",     fmt_amount(inv.get("amount_paid"))),
+            ("Currency",        (inv.get("currency") or "usd").upper()),
+            ("Service Period",  ts_to_date(inv.get("period_start")) + " to " + ts_to_date(inv.get("period_end"))),
+            ("Invoice Date",    ts_to_date(inv.get("created"))),
+            ("Receipt Number",  inv.get("receipt_number") or "--"),
+            ("Subscription ID", inv.get("subscription","--")),
+            ("Charge ID",       inv.get("charge","--")),
+        ]))
+        if inv.get("hosted_invoice_url"):
+            s.append(Spacer(1,8))
+            s.append(tip_box(
+                "Invoice URL: " + inv.get("hosted_invoice_url"),
+                GREEN_LT, GREEN_BDR, GREEN))
     else:
         s.append(tip_box(
-            "No invoice records found in the database for this customer. "
+            "No matching invoice found in the database for this dispute amount. "
             "Retrieve the invoice PDF from Stripe Dashboard > Customers > " +
             dispute.get("customer_email","") + " and attach alongside this document.",
             INDIGO_LT, INDIGO_BDR, colors.HexColor("#1e3a5f")))
@@ -783,7 +820,7 @@ def build_package(dispute_id):
     period_end = str(date.today())
     act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
     verdict = determine_verdict(dispute.get("reason"), loc.get("archived_at"), dispute.get("evidence_due_date"))
-    invoices = get_invoice(customer_email, dispute.get("customer_id"))
+    invoices = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"))
     slug = dispute_id.replace("_","-")
     return {
         slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_active, all_locations),
