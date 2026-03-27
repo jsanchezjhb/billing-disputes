@@ -346,32 +346,22 @@ def get_reason_content(reason, name, email, company, amount, created, t_act,
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def get_conn():
-    # Databricks Apps injects OAuth client credentials automatically.
-    # The SDK picks these up from env vars DATABRICKS_CLIENT_ID and
-    # DATABRICKS_CLIENT_SECRET without any extra configuration.
-    from databricks.sdk import WorkspaceClient
-    from databricks.sdk.oauth import ClientCredentials
-
+    # Databricks Apps automatically injects DATABRICKS_CLIENT_ID and
+    # DATABRICKS_CLIENT_SECRET as env vars. The databricks-sql-connector
+    # supports OAuth M2M directly via the credential_type parameter.
+    host          = os.environ.get("DATABRICKS_HOST", DATABRICKS_HOST)
     client_id     = os.environ.get("DATABRICKS_CLIENT_ID", "")
     client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
-    host          = os.environ.get("DATABRICKS_HOST", DATABRICKS_HOST)
 
     if client_id and client_secret:
-        # Use OAuth M2M (machine-to-machine) with injected service principal creds
-        credential_provider = ClientCredentials(
-            client_id=client_id,
-            client_secret=client_secret,
-            token_url=f"https://{host}/oidc/v1/token",
-            scopes=["all-apis"],
-            use_header=True,
-        )
         return databricks_sql.connect(
             server_hostname=host,
             http_path=DATABRICKS_HTTP_PATH,
-            credentials_provider=credential_provider,
+            auth_type="databricks-oauth",
+            client_id=client_id,
+            client_secret=client_secret,
         )
     elif DATABRICKS_TOKEN:
-        # Fallback: personal access token
         return databricks_sql.connect(
             server_hostname=host,
             http_path=DATABRICKS_HTTP_PATH,
