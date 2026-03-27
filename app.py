@@ -155,9 +155,9 @@ def get_plan_history(company_id):
 def get_activity(company_id, period_start, period_end):
     summary = run_query(
         "SELECT SUM(active_on_day) AS total_active_days, "
-        "SUM(web_active_on_day) AS web_active_days, "
-        "SUM(mobile_active_on_day) AS mobile_active_days, "
-        "SUM(scheduling_active_on_day) AS scheduling_active_days "
+        "SUM(CASE WHEN web_active_on_day = 1 THEN 1 ELSE 0 END) AS web_active_days, "
+        "SUM(CASE WHEN mobile_active_on_day = 1 THEN 1 ELSE 0 END) AS mobile_active_days, "
+        "SUM(CASE WHEN scheduling_active_on_day = 1 THEN 1 ELSE 0 END) AS scheduling_active_days "
         "FROM " + ACTIVITY_TABLE + " "
         "WHERE company_id = :cid AND date BETWEEN :start AND :end",
         {"cid": company_id, "start": period_start, "end": period_end},
@@ -288,10 +288,10 @@ def get_reason_content(reason, name, email, company, amount, created,
             "and unarchived (archived_at = NULL, active_now = TRUE). Cancellation requires "
             "an affirmative in-app action via Settings > Billing & Plan > Cancel Subscription. "
             "No such action was ever taken.",
-            "The account has logged " + str(t_act) + " active days since creation, "
-            "including " + str(w_act) + " web sessions and " + str(m_act) + " mobile sessions. "
-            "The account owner has " + str(signins) + " recorded sign-ins."
-            + (" Most recent activity: " + last_active + "." if last_active != "--" else ""),
+            "The account has been active on " + str(t_act) + " day(s) since creation"
+            + (" with most recent activity recorded on " + last_active if last_active != "--" else "") + ". "
+            "The account owner has " + str(signins) + " recorded sign-ins to the platform, "
+            "confirming the account has been accessed and used.",
             "Under Homebase policy, a customer must cancel within 30 days of a charge to "
             "receive a full refund. The customer did not cancel within 30 days of the "
             "disputed charge and has never canceled at all. The charge of " + amount + " is fully "
@@ -595,9 +595,9 @@ def pdf_activity(dispute, act_summary, active_dates, last_active):
     s.append(sh("Activity Summary During Disputed Period"))
     s.append(kv_table([
         ("Total Active Days", str(act_summary.get("total_active_days") or 0)),
-        ("Web Active Days", str(act_summary.get("web_active_days") or 0)),
-        ("Mobile Active Days", str(act_summary.get("mobile_active_days") or 0)),
-        ("Scheduling Active Days", str(act_summary.get("scheduling_active_days") or 0)),
+        ("Days with Web Activity", str(act_summary.get("web_active_days") or 0)),
+        ("Days with Mobile Activity", str(act_summary.get("mobile_active_days") or 0)),
+        ("Days with Scheduling Activity", str(act_summary.get("scheduling_active_days") or 0)),
         ("Last Recorded Activity", last_active),
     ]))
     s.append(Spacer(1,14))
