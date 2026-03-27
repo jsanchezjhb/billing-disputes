@@ -51,11 +51,10 @@ VERDICT_STYLES = {
 }
 
 STRIPE_UPLOAD_CATEGORIES = [
-    ("Dispute Narrative",             "Other"),
-    ("Dispute Details and Receipt",   "Receipt"),
-    ("Service Documentation",         "Service documentation"),
-    ("Customer Activity Logs",        "Customer communication"),
-    ("Refund and Cancellation Policy","Refund and cancellation policy"),
+    ("Dispute Narrative & Activity Logs", "Other"),
+    ("Dispute Details and Receipt",       "Receipt"),
+    ("Service Documentation",             "Service documentation"),
+    ("Refund and Cancellation Policy",    "Refund and cancellation policy"),
 ]
 
 # ── Connection ────────────────────────────────────────────────────────────────
@@ -561,6 +560,42 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
         ("Reason", reason_display), ("Status", dispute.get("status","--")),
         ("Evidence Due", fmt(dispute.get("evidence_due_date"))),
     ]))
+    # Activity logs appended directly to narrative
+    s.append(Spacer(1, 20))
+    s.append(HRFlowable(width="100%", thickness=1, color=GRAY_BDR))
+    s.append(Spacer(1, 14))
+    s.append(sh("Platform Activity Logs"))
+    s.append(kv_table([
+        ("Total Active Days",         str(act_summary.get("total_active_days") or 0)),
+        ("Days with Web Activity",    str(act_summary.get("web_active_days") or 0)),
+        ("Days with Mobile Activity", str(act_summary.get("mobile_active_days") or 0)),
+        ("Days with Scheduling",      str(act_summary.get("scheduling_active_days") or 0)),
+        ("Last Recorded Activity",    last_active),
+    ]))
+    s.append(Spacer(1, 14))
+    if active_dates:
+        s.append(sh("Active Dates Since Account Creation"))
+        rows_act = [[d, "Active"] for d in active_dates[:50]]
+        s.append(grid_table(rows_act, ["Date", "Status"], cw=[3.5*inch, 3.5*inch]))
+        if len(active_dates) > 50:
+            s.append(Spacer(1, 6))
+            s.append(bp("... and " + str(len(active_dates) - 50) + " additional active dates."))
+    else:
+        s.append(bp("No activity records found for this account."))
+    s.append(Spacer(1, 14))
+    if r == "fraudulent":
+        act_tip = ("Key evidence: The sustained login history and platform usage is inconsistent "
+                   "with an unauthorized account. A fraudster would not maintain this level of engagement.")
+    elif r == "product_not_received":
+        act_tip = ("Key evidence: As a SaaS product, Homebase is delivered digitally. The activity "
+                   "logs prove the customer had full, uninterrupted access during the disputed period.")
+    elif r == "product_unacceptable":
+        act_tip = ("Key evidence: Continued platform usage is inconsistent with a claim that the "
+                   "product was unacceptable. No complaint was filed prior to the chargeback.")
+    else:
+        act_tip = ("Key evidence: The customer actively used Homebase on the dates listed above, "
+                   "demonstrating the service was actively rendered and received.")
+    s.append(tip_box(act_tip, AMBER_LT, AMBER_BDR, AMBER))
     add_footer(s)
     doc.build(s)
     buf.seek(0)
@@ -842,8 +877,7 @@ def build_package(dispute_id):
         slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_active, all_locations),
         slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices),
         slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history),
-        slug + "_4_customer_activity_logs.pdf":     pdf_activity(dispute, act_summary, active_dates, last_active),
-        slug + "_5_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
+        slug + "_4_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
     }
 
 # ── Dash app ──────────────────────────────────────────────────────────────────
@@ -888,14 +922,12 @@ app.layout = html.Div([
         dcc.Download(id="dl-2"),
         dcc.Download(id="dl-3"),
         dcc.Download(id="dl-4"),
-        dcc.Download(id="dl-5"),
         dcc.Store(id="pdf-store", storage_type="memory"),
         # Buttons must exist in layout at startup for Dash to register their callbacks
         html.Button(id="dl-btn-1", n_clicks=0, style={"display":"none"}),
         html.Button(id="dl-btn-2", n_clicks=0, style={"display":"none"}),
         html.Button(id="dl-btn-3", n_clicks=0, style={"display":"none"}),
         html.Button(id="dl-btn-4", n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-5", n_clicks=0, style={"display":"none"}),
 
 
 
@@ -994,11 +1026,6 @@ def dl3(n, store):
               State("pdf-store","data"), prevent_initial_call=True)
 def dl4(n, store):
     return _download(n, store, 3)
-
-@app.callback(Output("dl-5","data"), Input("dl-btn-5","n_clicks"),
-              State("pdf-store","data"), prevent_initial_call=True)
-def dl5(n, store):
-    return _download(n, store, 4)
 
 def _download(n, store, idx):
     if not store or not n:
