@@ -16,7 +16,8 @@ from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 # ── Config ────────────────────────────────────────────────────────────────────
 DATABRICKS_HOST      = "homebase-staging.cloud.databricks.com"
 DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/16984dfe9a2c3705"
-DATABRICKS_TOKEN     = os.environ.get("DATABRICKS_TOKEN", "")
+# When running inside a Databricks App, the token is injected automatically
+DATABRICKS_TOKEN     = os.environ.get("DATABRICKS_TOKEN", os.environ.get("DATABRICKS_RUNTIME_TOKEN", ""))
 
 DISPUTES_TABLE  = "prod_redshift_replica.stripe.i_charge_dispute"
 USERS_TABLE     = "prod_redshift_replica.public.users"
