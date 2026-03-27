@@ -846,10 +846,15 @@ app.layout = html.Div([
                            "border":"none","borderRadius":"8px","fontSize":"15px",
                            "fontWeight":"700","cursor":"pointer"}),
 
-        html.Div(id="status-output",   style={"marginTop":"16px"}),
+        dcc.Loading(
+            id="loading",
+            type="circle",
+            color="#4f46e5",
+            children=html.Div(id="status-output", style={"marginTop":"16px"}),
+        ),
         html.Div(id="download-section",style={"marginTop":"20px"}),
         *[dcc.Download(id=f"dl-{i}") for i in range(1,6)],
-        dcc.Store(id="pdf-store"),
+        dcc.Store(id="pdf-store", storage_type="memory"),
 
     ], style={"maxWidth":"580px","margin":"0 auto","background":"#fff",
               "border":"1px solid #e5e7eb","borderRadius":"16px","padding":"32px"}),
