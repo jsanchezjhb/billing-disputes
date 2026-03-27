@@ -346,20 +346,35 @@ def get_reason_content(reason, name, email, company, amount, created, t_act,
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def get_conn():
-    # Use Databricks SDK runtime_native_auth which automatically picks up
-    # whatever credentials are available (OAuth M2M, PAT, etc.)
-    from databricks.sdk import WorkspaceClient
-    from databricks.sdk.credentials_provider import runtime_native_auth
+    # Databricks Apps injects DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET.
+    # Use the SDK Config + oauth_service_principal which is the documented
+    # M2M pattern for connecting to SQL warehouses from service principals.
+    from databricks.sdk.core import Config, oauth_service_principal
 
-    host = os.environ.get("DATABRICKS_HOST", DATABRICKS_HOST)
-    client = WorkspaceClient(host=f"https://{host}")
-    oauth_provider = lambda: runtime_native_auth(client.config)
+    host          = os.environ.get("DATABRICKS_HOST", DATABRICKS_HOST)
+    client_id     = os.environ.get("DATABRICKS_CLIENT_ID", "")
+    client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
 
-    return databricks_sql.connect(
-        server_hostname=host,
-        http_path=DATABRICKS_HTTP_PATH,
-        credentials_provider=oauth_provider,
-    )
+    if client_id and client_secret:
+        config = Config(
+            host=f"https://{host}",
+            client_id=client_id,
+            client_secret=client_secret,
+        )
+        credential_provider = oauth_service_principal(config)
+        return databricks_sql.connect(
+            server_hostname=host,
+            http_path=DATABRICKS_HTTP_PATH,
+            credentials_provider=credential_provider,
+        )
+    elif DATABRICKS_TOKEN:
+        return databricks_sql.connect(
+            server_hostname=host,
+            http_path=DATABRICKS_HTTP_PATH,
+            access_token=DATABRICKS_TOKEN,
+        )
+    else:
+        raise RuntimeError("No Databricks credentials found in environment.")
 
 def esc(val):
     """Safely escape a value for inline SQL substitution."""
