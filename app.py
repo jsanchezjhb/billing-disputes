@@ -391,7 +391,8 @@ def get_dispute(dispute_id):
     row = rows[0]
     # Convert amount from cents to dollars
     try:
-        row["amount"] = f"${int(row["amount"]) / 100:.2f}"
+        amt = row["amount"]
+        row["amount"] = f"${int(amt) / 100:.2f}"
     except (TypeError, ValueError):
         pass
     return row
