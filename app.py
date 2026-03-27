@@ -361,18 +361,29 @@ def get_conn():
         credentials_provider=oauth_provider,
     )
 
+def esc(val):
+    """Safely escape a value for inline SQL substitution."""
+    if val is None:
+        return "NULL"
+    if isinstance(val, (int, float)):
+        return str(val)
+    return "'" + str(val).replace("'", "''") + "'"
+
 def run_query(sql, params=None):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            # Convert named :param style to positional for Databricks SQL
-            if params:
-                for key, val in params.items():
-                    sql = sql.replace(f":{key}", "'"+str(val).replace("'","''") +"'" if isinstance(val, str) else str(val))
-            cur.execute(sql)
-            if cur.description is None:
-                return []
-            cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, row)) for row in cur.fetchall()]
+    """Run a SQL query. params is a dict of {name: value} substituted via esc()."""
+    if params:
+        for key, val in params.items():
+            sql = sql.replace(":" + key, esc(val))
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                if cur.description is None:
+                    return []
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+    except Exception as e:
+        raise RuntimeError(f"Query failed: {str(e)} | SQL: {sql[:300]}") from e
 
 def fmt(val):
     if val is None:
