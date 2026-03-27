@@ -346,29 +346,20 @@ def get_reason_content(reason, name, email, company, amount, created, t_act,
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def get_conn():
-    # Databricks Apps automatically injects DATABRICKS_CLIENT_ID and
-    # DATABRICKS_CLIENT_SECRET as env vars. The databricks-sql-connector
-    # supports OAuth M2M directly via the credential_type parameter.
-    host          = os.environ.get("DATABRICKS_HOST", DATABRICKS_HOST)
-    client_id     = os.environ.get("DATABRICKS_CLIENT_ID", "")
-    client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
+    # Use Databricks SDK runtime_native_auth which automatically picks up
+    # whatever credentials are available (OAuth M2M, PAT, etc.)
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.credentials_provider import runtime_native_auth
 
-    if client_id and client_secret:
-        return databricks_sql.connect(
-            server_hostname=host,
-            http_path=DATABRICKS_HTTP_PATH,
-            auth_type="databricks-oauth",
-            client_id=client_id,
-            client_secret=client_secret,
-        )
-    elif DATABRICKS_TOKEN:
-        return databricks_sql.connect(
-            server_hostname=host,
-            http_path=DATABRICKS_HTTP_PATH,
-            access_token=DATABRICKS_TOKEN,
-        )
-    else:
-        raise ValueError("No valid Databricks credentials found.")
+    host = os.environ.get("DATABRICKS_HOST", DATABRICKS_HOST)
+    client = WorkspaceClient(host=f"https://{host}")
+    oauth_provider = lambda: runtime_native_auth(client.config)
+
+    return databricks_sql.connect(
+        server_hostname=host,
+        http_path=DATABRICKS_HTTP_PATH,
+        credentials_provider=oauth_provider,
+    )
 
 def run_query(sql, params=None):
     with get_conn() as conn:
