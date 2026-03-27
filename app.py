@@ -16,14 +16,10 @@ from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 # ── Config ────────────────────────────────────────────────────────────────────
 DATABRICKS_HOST      = "homebase-staging.cloud.databricks.com"
 DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/16984dfe9a2c3705"
-# Token resolution order:
-# 1. DATABRICKS_TOKEN env var (set manually in app Environment tab)
-# 2. DATABRICKS_RUNTIME_TOKEN (injected by Databricks Apps runtime)
-# 3. DATABRICKS_AAD_TOKEN (Azure AD token if applicable)
+# DB_TOKEN is injected by Databricks Apps from the Secret resource named "DB_TOKEN"
 DATABRICKS_TOKEN = (
-    os.environ.get("DATABRICKS_TOKEN")
-    or os.environ.get("DATABRICKS_RUNTIME_TOKEN")
-    or os.environ.get("DATABRICKS_AAD_TOKEN")
+    os.environ.get("DB_TOKEN")
+    or os.environ.get("DATABRICKS_TOKEN")
     or ""
 )
 
@@ -346,35 +342,17 @@ def get_reason_content(reason, name, email, company, amount, created, t_act,
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def get_conn():
-    # Databricks Apps injects DATABRICKS_CLIENT_ID and DATABRICKS_CLIENT_SECRET.
-    # Use the SDK Config + oauth_service_principal which is the documented
-    # M2M pattern for connecting to SQL warehouses from service principals.
-    from databricks.sdk.core import Config, oauth_service_principal
-
-    host          = os.environ.get("DATABRICKS_HOST", DATABRICKS_HOST)
-    client_id     = os.environ.get("DATABRICKS_CLIENT_ID", "")
-    client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
-
-    if client_id and client_secret:
-        config = Config(
-            host=f"https://{host}",
-            client_id=client_id,
-            client_secret=client_secret,
-        )
-        credential_provider = oauth_service_principal(config)
-        return databricks_sql.connect(
-            server_hostname=host,
-            http_path=DATABRICKS_HTTP_PATH,
-            credentials_provider=credential_provider,
-        )
-    elif DATABRICKS_TOKEN:
-        return databricks_sql.connect(
-            server_hostname=host,
-            http_path=DATABRICKS_HTTP_PATH,
-            access_token=DATABRICKS_TOKEN,
-        )
-    else:
-        raise RuntimeError("No Databricks credentials found in environment.")
+    # Official Databricks Apps auth pattern:
+    # Config() auto-reads DATABRICKS_HOST, DATABRICKS_CLIENT_ID,
+    # DATABRICKS_CLIENT_SECRET which Databricks Apps injects automatically.
+    # See: docs.databricks.com/dev-tools/databricks-apps/auth
+    from databricks.sdk.core import Config
+    cfg = Config()
+    return databricks_sql.connect(
+        server_hostname=cfg.host,
+        http_path=DATABRICKS_HTTP_PATH,
+        credentials_provider=lambda: cfg.authenticate,
+    )
 
 def esc(val):
     """Safely escape a value for inline SQL substitution."""
