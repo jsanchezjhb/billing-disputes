@@ -4,11 +4,13 @@ Databricks App that generates a complete Stripe chargeback evidence package for 
 
 ## What it does
 
-1. Takes a Stripe dispute ID as input
-2. Fetches the dispute from the Stripe API (server-side — no CORS issues)
-3. Resolves the charge → invoice → customer email → internal Homebase account
-4. Queries the Homebase database for location status, activity logs, and plan history
+1. Enter a Stripe dispute ID in the UI
+2. Looks up the dispute from `prod_redshift_replica.stripe.i_charge_dispute`
+3. Resolves the customer email to an internal Homebase account
+4. Queries location status, activity logs, and plan history from the DB
 5. Generates 5 labeled PDFs ready to upload directly to Stripe's evidence form
+
+No Stripe API calls. No secret keys. Everything comes from the database.
 
 ## Output PDFs
 
@@ -20,43 +22,35 @@ Databricks App that generates a complete Stripe chargeback evidence package for 
 | `{id}_4_customer_activity_logs.pdf` | Customer communication |
 | `{id}_5_refund_cancellation_policy.pdf` | Refund and cancellation policy |
 
-## Setup
+## Database Tables Used
 
-### 1. Databricks Secrets
+| Table | Purpose |
+|---|---|
+| `prod_redshift_replica.stripe.i_charge_dispute` | Dispute details (amount, reason, due date, customer email) |
+| `prod_redshift_replica.public.users` | Resolve email to user_id |
+| `prod_redshift_replica.public.locations` | Location status, archived_at, active_now |
+| `prod_redshift_replica.public.upgrades_downgrades` | Subscription/plan change history |
+| `prod_redshift_replica.public.fact_locations_by_day` | Daily activity logs |
 
-Store your Stripe secret key in Databricks Secrets before deploying:
+## Databricks App Setup
 
-```python
-# Run in a Databricks notebook
-dbutils.secrets.createScope("billing-disputes")
-dbutils.secrets.put(
-    scope="billing-disputes",
-    key="stripe-secret-key",
-    string_value="sk_live_..."  # use a restricted key with disputes:read + charges:read
-)
-```
+1. Connect this GitHub repo in the Databricks App configuration
+2. Add your SQL Warehouse as an app resource
+3. Set instance size to Medium (2 vCPU, 6 GB) -- no other configuration needed
+4. Deploy
 
-### 2. Databricks App Configuration
-
-- **App name:** billing-disputes-package
-- **Git repo:** this repository
-- **Instance size:** Medium (2 vCPU, 6 GB)
-- **Resources:** Add your SQL Warehouse
-
-### 3. Stripe Restricted Key
-
-Create a restricted key in Stripe Dashboard → Developers → API keys with:
-- `Disputes` → Read
-- `Charges` → Read
+The app uses DATABRICKS_TOKEN from the environment automatically -- no manual secrets setup required.
 
 ## Files
 
-- `app.py` — main Dash application
-- `requirements.txt` — Python dependencies
+- `app.py` -- main Dash application
+- `requirements.txt` -- Python dependencies (dash, databricks-sql-connector, reportlab)
 
 ## Refund & Cancellation Policy
 
-- 30-day full refund window from **each charge date** (not signup date)
+Per Homebase policy (baked into the generated PDFs):
+
+- 30-day full refund window from each charge date (not signup date)
 - Applies to both monthly and annual plans
 - No prorated refunds under any circumstances
-- Cancellation must be completed in-app: Settings → Billing & Plan → Cancel Subscription
+- Cancellation must be completed in-app: Settings > Billing & Plan > Cancel Subscription
