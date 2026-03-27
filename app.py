@@ -288,9 +288,9 @@ def get_reason_content(reason, name, email, company, amount, created,
             "and unarchived (archived_at = NULL, active_now = TRUE). Cancellation requires "
             "an affirmative in-app action via Settings > Billing & Plan > Cancel Subscription. "
             "No such action was ever taken.",
-            "The customer actively used the platform on " + str(t_act) + " days during the disputed "
-            "period, including " + str(w_act) + " web sessions and " + str(m_act) + " mobile sessions. "
-            "The account owner has " + str(signins) + " total all-time sign-ins (" + str(web_si) + " web)."
+            "The account has logged " + str(t_act) + " active days since creation, "
+            "including " + str(w_act) + " web sessions and " + str(m_act) + " mobile sessions. "
+            "The account owner has " + str(signins) + " recorded sign-ins."
             + (" Most recent activity: " + last_active + "." if last_active != "--" else ""),
             "Under Homebase policy, a customer must cancel within 30 days of a charge to "
             "receive a full refund. The customer did not cancel within 30 days of the "
@@ -481,8 +481,10 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     t_act   = act_summary.get("total_active_days") or 0
     m_act   = act_summary.get("mobile_active_days") or 0
     w_act   = act_summary.get("web_active_days") or 0
-    signins = user.get("sign_in_count",0) if user else 0
     web_si  = user.get("web_sign_in_count",0) if user else 0
+    # sign_in_count can be 0 even when web_sign_in_count > 0 due to data inconsistency
+    # Use the higher of the two as the total
+    signins = max(user.get("sign_in_count",0) or 0, web_si) if user else 0
     paras = get_reason_content(dispute.get("reason"), name, email, company, amount, created,
                                t_act, w_act, m_act, signins, web_si, last_active, all_locations)
     for p in paras:
@@ -698,13 +700,17 @@ def build_package(dispute_id):
     plan_history  = get_plan_history(company_id)
     all_locations = get_all_locations(company_id)
     created = str(dispute.get("created_at") or "")[:10]
-    if created and created not in ("--",""):
+    # Use account creation date as period start to capture all activity
+    # Fall back to 12 months ago if we cant determine account age
+    loc_created = fmt(loc.get("created_at")) if loc else "--"
+    if loc_created and loc_created != "--":
+        period_start = loc_created
+    elif created and created not in ("--",""):
         center       = datetime.strptime(created, "%Y-%m-%d").date()
-        period_start = str(center - timedelta(days=60))
-        period_end   = str(center + timedelta(days=30))
+        period_start = str(center - timedelta(days=365))
     else:
-        period_start = str(date.today() - timedelta(days=90))
-        period_end   = str(date.today())
+        period_start = str(date.today() - timedelta(days=365))
+    period_end = str(date.today())
     act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
     verdict = determine_verdict(dispute.get("reason"), loc.get("archived_at"), dispute.get("evidence_due_date"))
     slug = dispute_id.replace("_","-")
