@@ -124,7 +124,7 @@ def get_reason_content(reason, name, email, company, amount, created, t_act,
             f"account is billed as a separate subscription. What may appear to be multiple "
             f"charges is actually each location being billed individually for its own subscription.",
 
-            f"The account ("{company}") has {loc_count} active location(s) on file: "
+            f"The account ({company!r}) has {loc_count} active location(s) on file: "
             f"{loc_names}. Each location carries its own subscription and is billed "
             f"separately. The disputed charge of {amount} corresponds to a single location's "
             f"subscription fee for one billing period -- it is not a duplicate.",
