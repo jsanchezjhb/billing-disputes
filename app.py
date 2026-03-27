@@ -175,6 +175,7 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None):
 def get_account(customer_email):
     users = run_query(
         "SELECT user_id, first_name, last_name, email, last_sign_in_at, "
+        "current_sign_in_at, mobile_last_used_at, "
         "web_sign_in_count, sign_in_count, highest_level_location "
         "FROM " + USERS_TABLE + " WHERE LOWER(email) = LOWER(:email)",
         {"email": customer_email},
@@ -542,9 +543,12 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     m_act   = act_summary.get("mobile_active_days") or 0
     w_act   = act_summary.get("web_active_days") or 0
     web_si  = user.get("web_sign_in_count",0) if user else 0
-    # sign_in_count can be 0 even when web_sign_in_count > 0 due to data inconsistency
-    # Use the higher of the two as the total
     signins = max(user.get("sign_in_count",0) or 0, web_si) if user else 0
+    best_last_active = (user.get("last_sign_in_at") or
+                        user.get("current_sign_in_at") or
+                        user.get("mobile_last_used_at")) if user else None
+    if best_last_active and last_active == "--":
+        last_active = fmt(best_last_active)
     paras = get_reason_content(dispute.get("reason"), name, email, company, amount, created,
                                t_act, w_act, m_act, signins, web_si, last_active, all_locations)
     for p in paras:
@@ -666,11 +670,21 @@ def pdf_service_docs(dispute, user, loc, plan_history):
                      GREEN_LT, GREEN_BDR, GREEN))
     s.append(Spacer(1,12))
     s.append(sh("Owner Sign-In History"))
-    s.append(kv_table([
-        ("Total Sign-Ins", str(user.get("sign_in_count","--")) if user else "--"),
-        ("Web Sign-Ins", str(user.get("web_sign_in_count","--")) if user else "--"),
-        ("Last Sign-In", fmt(user.get("last_sign_in_at")) if user else "--"),
-    ]))
+    if user:
+        # Use best available last sign-in date across all fields
+        last_si = (user.get("last_sign_in_at") or
+                   user.get("current_sign_in_at") or
+                   user.get("mobile_last_used_at"))
+        web_si = user.get("web_sign_in_count") or 0
+        signin_rows = [
+            ("Web Sign-Ins (all time)",  str(web_si)),
+            ("Last Recorded Sign-In",    fmt(last_si) if last_si else "--"),
+        ]
+        if user.get("mobile_last_used_at"):
+            signin_rows.append(("Last Mobile Activity", fmt(user.get("mobile_last_used_at"))))
+        s.append(kv_table(signin_rows))
+    else:
+        s.append(bp("No sign-in data available."))
     s.append(Spacer(1,18))
     s.append(HRFlowable(width="100%", thickness=1, color=GRAY_BDR))
     s.append(Spacer(1,18))
@@ -894,14 +908,18 @@ app.layout = html.Div([
     Output("status-output","children"),
     Output("download-section","children"),
     Output("pdf-store","data"),
+    Output("generate-btn","disabled"),
+    Output("generate-btn","children"),
     Input("generate-btn","n_clicks"),
     State("dispute-input","value"),
     prevent_initial_call=True,
 )
 def on_generate(n_clicks, dispute_id):
     if not dispute_id or not dispute_id.strip():
-        return html.Div("Please enter a dispute ID.",
-                        style={"color":"#dc2626","fontSize":"13px"}), [], None
+        return (html.Div("Please enter a dispute ID.",
+                        style={"color":"#dc2626","fontSize":"13px"}),
+                [], None, False, "Generate Evidence Package")
+    # Clear previous results immediately so old content doesnt persist
     try:
         pdfs      = build_package(dispute_id.strip())
         filenames = list(pdfs.keys())
@@ -943,7 +961,7 @@ def on_generate(n_clicks, dispute_id):
         ], style={"background":"#f0fdf4","border":"1px solid #a7f3d0",
                   "borderRadius":"8px","padding":"10px 14px","marginBottom":"12px"})
 
-        return status, [status] + rows + [dl_buttons], store
+        return status, rows + [dl_buttons], store, False, "Generate Evidence Package"
 
     except Exception as e:
         return (
@@ -951,7 +969,7 @@ def on_generate(n_clicks, dispute_id):
                      style={"background":"#fef2f2","border":"1px solid #fecaca",
                             "borderRadius":"8px","padding":"10px 14px",
                             "color":"#991b1b","fontSize":"13px"}),
-            [], None,
+            [], None, False, "Generate Evidence Package",
         )
 
 
