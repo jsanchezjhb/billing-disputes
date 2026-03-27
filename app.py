@@ -175,7 +175,7 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None):
 def get_account(customer_email):
     users = run_query(
         "SELECT user_id, first_name, last_name, email, last_sign_in_at, "
-        "current_sign_in_at, mobile_last_used_at, "
+        "mobile_last_used_at, "
         "web_sign_in_count, sign_in_count, highest_level_location "
         "FROM " + USERS_TABLE + " WHERE LOWER(email) = LOWER(:email)",
         {"email": customer_email},
@@ -545,7 +545,6 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     web_si  = user.get("web_sign_in_count",0) if user else 0
     signins = max(user.get("sign_in_count",0) or 0, web_si) if user else 0
     best_last_active = (user.get("last_sign_in_at") or
-                        user.get("current_sign_in_at") or
                         user.get("mobile_last_used_at")) if user else None
     if best_last_active and last_active == "--":
         last_active = fmt(best_last_active)
@@ -673,7 +672,6 @@ def pdf_service_docs(dispute, user, loc, plan_history):
     if user:
         # Use best available last sign-in date across all fields
         last_si = (user.get("last_sign_in_at") or
-                   user.get("current_sign_in_at") or
                    user.get("mobile_last_used_at"))
         web_si = user.get("web_sign_in_count") or 0
         signin_rows = [
