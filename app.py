@@ -175,7 +175,7 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None):
 def get_account(customer_email):
     users = run_query(
         "SELECT user_id, first_name, last_name, email, last_sign_in_at, "
-        "mobile_last_used_at, "
+        "mobile_last_used_at, mobile_last_used_info, "
         "web_sign_in_count, sign_in_count, highest_level_location "
         "FROM " + USERS_TABLE + " WHERE LOWER(email) = LOWER(:email)",
         {"email": customer_email},
@@ -679,7 +679,11 @@ def pdf_service_docs(dispute, user, loc, plan_history):
             ("Last Recorded Sign-In",    fmt(last_si) if last_si else "--"),
         ]
         if user.get("mobile_last_used_at"):
-            signin_rows.append(("Last Mobile Activity", fmt(user.get("mobile_last_used_at"))))
+            mob_label = "Last Mobile Activity"
+            mob_val   = fmt(user.get("mobile_last_used_at"))
+            if user.get("mobile_last_used_info"):
+                mob_val = mob_val + " (" + str(user.get("mobile_last_used_info")) + ")"
+            signin_rows.append((mob_label, mob_val))
         s.append(kv_table(signin_rows))
     else:
         s.append(bp("No sign-in data available."))
