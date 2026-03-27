@@ -364,7 +364,11 @@ def get_conn():
 def run_query(sql, params=None):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(sql, params or {})
+            # Convert named :param style to positional for Databricks SQL
+            if params:
+                for key, val in params.items():
+                    sql = sql.replace(f":{key}", "'"+str(val).replace("'","''") +"'" if isinstance(val, str) else str(val))
+            cur.execute(sql)
             if cur.description is None:
                 return []
             cols = [d[0] for d in cur.description]
@@ -382,7 +386,15 @@ def get_dispute(dispute_id):
         f"FROM {DISPUTES_TABLE} WHERE dispute_id = :did",
         {"did": dispute_id},
     )
-    return rows[0] if rows else None
+    if not rows:
+        return None
+    row = rows[0]
+    # Convert amount from cents to dollars
+    try:
+        row["amount"] = f"${int(row["amount"]) / 100:.2f}"
+    except (TypeError, ValueError):
+        pass
+    return row
 
 def get_account(customer_email):
     users = run_query(
