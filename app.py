@@ -22,6 +22,7 @@ USERS_TABLE     = "prod_redshift_replica.public.users"
 LOCATIONS_TABLE = "prod_redshift_replica.public.locations"
 UPGRADES_TABLE  = "prod_redshift_replica.public.upgrades_downgrades"
 ACTIVITY_TABLE  = "prod_redshift_replica.public.fact_locations_by_day"
+INVOICE_TABLE   = "prod_redshift_replica.stripe.invoice"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 DARK       = colors.HexColor("#0f172a")
@@ -111,6 +112,35 @@ def get_dispute(dispute_id):
     except (TypeError, ValueError):
         pass
     return row
+
+def get_invoice(customer_email, customer_id=None):
+    """Fetch the most recent paid invoice for this customer from stripe.invoice."""
+    rows = run_query(
+        "SELECT id, number, status, amount_paid, amount_due, total, "
+        "currency, period_start, period_end, billing_reason, "
+        "customer_name, customer_email, subscription, charge, "
+        "receipt_number, hosted_invoice_url, created, paid "
+        "FROM " + INVOICE_TABLE + " "
+        "WHERE LOWER(customer_email) = LOWER(:email) "
+        "AND paid = 'true' "
+        "ORDER BY created DESC LIMIT 10",
+        {"email": customer_email},
+    )
+    if not rows:
+        # Fallback: try by customer_id
+        if customer_id:
+            rows = run_query(
+                "SELECT id, number, status, amount_paid, amount_due, total, "
+                "currency, period_start, period_end, billing_reason, "
+                "customer_name, customer_email, subscription, charge, "
+                "receipt_number, hosted_invoice_url, created, paid "
+                "FROM " + INVOICE_TABLE + " "
+                "WHERE customer = :cid "
+                "AND paid = 'true' "
+                "ORDER BY created DESC LIMIT 10",
+                {"cid": customer_id},
+            )
+    return rows or []
 
 def get_account(customer_email):
     users = run_query(
@@ -503,29 +533,69 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     buf.seek(0)
     return buf.read()
 
-def pdf_receipt(dispute):
+def fmt_amount(val):
+    """Convert cents string to dollar string."""
+    if not val or val == "--":
+        return "--"
+    try:
+        return "$" + "{:.2f}".format(int(val) / 100)
+    except (ValueError, TypeError):
+        return str(val)
+
+def pdf_receipt(dispute, invoices=None):
     buf = io.BytesIO()
-    doc = make_doc(buf, "Dispute Details")
+    doc = make_doc(buf, "Dispute Details & Receipt")
     s = []
     doc_header(s, dispute["dispute_id"])
     section_badge(s, "2.", "Dispute Details & Receipt", "Receipt",
                   colors.HexColor("#f5f3ff"), colors.HexColor("#ddd6fe"), colors.HexColor("#5b21b6"))
-    s.append(sh("Stripe Dispute Record"))
+
+    # Dispute summary
+    s.append(sh("Dispute Summary"))
     s.append(kv_table([
-        ("Dispute ID", dispute.get("dispute_id","--")),
-        ("Status", dispute.get("status","--")),
-        ("Reason", (dispute.get("reason") or "").replace("_"," ").title()),
-        ("Amount", dispute.get("amount","--")),
+        ("Dispute ID",    dispute.get("dispute_id","--")),
+        ("Status",        dispute.get("status","--")),
+        ("Reason",        (dispute.get("reason") or "").replace("_"," ").title()),
+        ("Amount",        dispute.get("amount","--")),
         ("Customer Name", dispute.get("customer_name","--")),
-        ("Customer Email", dispute.get("customer_email","--")),
-        ("Customer ID", dispute.get("customer_id","--")),
-        ("Created", fmt(dispute.get("created_at"))),
-        ("Last Updated", fmt(dispute.get("last_updated_at"))),
-        ("Evidence Due", fmt(dispute.get("evidence_due_date"))),
+        ("Customer Email",dispute.get("customer_email","--")),
+        ("Evidence Due",  fmt(dispute.get("evidence_due_date"))),
     ]))
-    s.append(Spacer(1,14))
-    s.append(tip_box("Retrieve the original invoice and payment receipt from Stripe Dashboard > Payments and attach alongside this document.",
-                     INDIGO_LT, INDIGO_BDR, colors.HexColor("#1e3a5f")))
+    s.append(Spacer(1,18))
+
+    # Invoice receipts
+    s.append(sh("Billing History & Receipts"))
+    if invoices:
+        for inv in invoices:
+            s.append(Spacer(1,6))
+            inv_num = inv.get("number") or inv.get("id","--")
+            s.append(Paragraph("<b>Invoice " + inv_num + "</b>",
+                ParagraphStyle("ih", fontName="Helvetica-Bold", fontSize=10, textColor=DARK, spaceAfter=6)))
+            s.append(kv_table([
+                ("Invoice Number",  inv.get("number","--")),
+                ("Status",          (inv.get("status") or "--").title()),
+                ("Billing Reason",  (inv.get("billing_reason") or "--").replace("_"," ").title()),
+                ("Amount Due",      fmt_amount(inv.get("amount_due"))),
+                ("Amount Paid",     fmt_amount(inv.get("amount_paid"))),
+                ("Currency",        (inv.get("currency") or "usd").upper()),
+                ("Service Period",  fmt(inv.get("period_start")) + " to " + fmt(inv.get("period_end"))),
+                ("Invoice Date",    fmt(inv.get("created"))),
+                ("Receipt Number",  inv.get("receipt_number") or "--"),
+                ("Subscription ID", inv.get("subscription","--")),
+                ("Charge ID",       inv.get("charge","--")),
+            ]))
+            if inv.get("hosted_invoice_url"):
+                s.append(Spacer(1,4))
+                s.append(bp("Invoice URL: " + inv.get("hosted_invoice_url")))
+            s.append(Spacer(1,10))
+            s.append(HRFlowable(width="100%", thickness=0.5, color=GRAY_BDR))
+    else:
+        s.append(tip_box(
+            "No invoice records found in the database for this customer. "
+            "Retrieve the invoice PDF from Stripe Dashboard > Customers > " +
+            dispute.get("customer_email","") + " and attach alongside this document.",
+            INDIGO_LT, INDIGO_BDR, colors.HexColor("#1e3a5f")))
+
     add_footer(s)
     doc.build(s)
     buf.seek(0)
@@ -713,10 +783,11 @@ def build_package(dispute_id):
     period_end = str(date.today())
     act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
     verdict = determine_verdict(dispute.get("reason"), loc.get("archived_at"), dispute.get("evidence_due_date"))
+    invoices = get_invoice(customer_email, dispute.get("customer_id"))
     slug = dispute_id.replace("_","-")
     return {
         slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_active, all_locations),
-        slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute),
+        slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices),
         slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history),
         slug + "_4_customer_activity_logs.pdf":     pdf_activity(dispute, act_summary, active_dates, last_active),
         slug + "_5_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
