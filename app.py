@@ -16,8 +16,16 @@ from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 # ── Config ────────────────────────────────────────────────────────────────────
 DATABRICKS_HOST      = "homebase-staging.cloud.databricks.com"
 DATABRICKS_HTTP_PATH = "/sql/1.0/warehouses/16984dfe9a2c3705"
-# When running inside a Databricks App, the token is injected automatically
-DATABRICKS_TOKEN     = os.environ.get("DATABRICKS_TOKEN", os.environ.get("DATABRICKS_RUNTIME_TOKEN", ""))
+# Token resolution order:
+# 1. DATABRICKS_TOKEN env var (set manually in app Environment tab)
+# 2. DATABRICKS_RUNTIME_TOKEN (injected by Databricks Apps runtime)
+# 3. DATABRICKS_AAD_TOKEN (Azure AD token if applicable)
+DATABRICKS_TOKEN = (
+    os.environ.get("DATABRICKS_TOKEN")
+    or os.environ.get("DATABRICKS_RUNTIME_TOKEN")
+    or os.environ.get("DATABRICKS_AAD_TOKEN")
+    or ""
+)
 
 DISPUTES_TABLE  = "prod_redshift_replica.stripe.i_charge_dispute"
 USERS_TABLE     = "prod_redshift_replica.public.users"
@@ -338,11 +346,39 @@ def get_reason_content(reason, name, email, company, amount, created, t_act,
 
 # ── DB helpers ────────────────────────────────────────────────────────────────
 def get_conn():
-    return databricks_sql.connect(
-        server_hostname=DATABRICKS_HOST,
-        http_path=DATABRICKS_HTTP_PATH,
-        access_token=DATABRICKS_TOKEN,
-    )
+    # Databricks Apps injects OAuth client credentials automatically.
+    # The SDK picks these up from env vars DATABRICKS_CLIENT_ID and
+    # DATABRICKS_CLIENT_SECRET without any extra configuration.
+    from databricks.sdk import WorkspaceClient
+    from databricks.sdk.oauth import ClientCredentials
+
+    client_id     = os.environ.get("DATABRICKS_CLIENT_ID", "")
+    client_secret = os.environ.get("DATABRICKS_CLIENT_SECRET", "")
+    host          = os.environ.get("DATABRICKS_HOST", DATABRICKS_HOST)
+
+    if client_id and client_secret:
+        # Use OAuth M2M (machine-to-machine) with injected service principal creds
+        credential_provider = ClientCredentials(
+            client_id=client_id,
+            client_secret=client_secret,
+            token_url=f"https://{host}/oidc/v1/token",
+            scopes=["all-apis"],
+            use_header=True,
+        )
+        return databricks_sql.connect(
+            server_hostname=host,
+            http_path=DATABRICKS_HTTP_PATH,
+            credentials_provider=credential_provider,
+        )
+    elif DATABRICKS_TOKEN:
+        # Fallback: personal access token
+        return databricks_sql.connect(
+            server_hostname=host,
+            http_path=DATABRICKS_HTTP_PATH,
+            access_token=DATABRICKS_TOKEN,
+        )
+    else:
+        raise ValueError("No valid Databricks credentials found.")
 
 def run_query(sql, params=None):
     with get_conn() as conn:
