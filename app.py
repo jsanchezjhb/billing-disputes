@@ -534,7 +534,8 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     doc_header(s, dispute["dispute_id"])
     section_badge(s, "1.", "Dispute Narrative", "Other", INDIGO_LT, INDIGO_BDR, colors.HexColor("#1e3a5f"))
     v_label, v_bg, v_bdr, v_col = VERDICT_STYLES.get(verdict, VERDICT_STYLES["NO_DATA"])
-    reason_display = (dispute.get("reason") or "general").replace("_"," ").title()
+    r              = (dispute.get("reason") or "general").lower()
+    reason_display = r.replace("_"," ").title()
     s.append(tip_box("VERDICT: " + v_label + "  |  Dispute reason: " + reason_display, v_bg, v_bdr, v_col))
     s.append(Spacer(1,14))
     s.append(sh("Dispute Statement"))
@@ -941,6 +942,7 @@ app.layout = html.Div([
 
         html.Button("Generate Evidence Package", id="generate-btn", n_clicks=0,
                     disabled=False,
+                    **{"data-generating": ""},
                     style={"width":"100%","padding":"13px","background":"#4f46e5","color":"#fff",
                            "border":"none","borderRadius":"8px","fontSize":"15px",
                            "fontWeight":"700","cursor":"pointer",
@@ -976,6 +978,27 @@ app.layout = html.Div([
 ], style={"fontFamily":"-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
           "background":"#f8fafc","minHeight":"100vh"})
 
+
+# Clientside callback - fires instantly in the browser to disable button on click
+app.clientside_callback(
+    """
+    function(n_clicks) {
+        if (n_clicks > 0) {
+            var btn = document.getElementById('generate-btn');
+            if (btn) {
+                btn.disabled = true;
+                btn.style.opacity = '0.5';
+                btn.style.cursor = 'not-allowed';
+                btn.innerText = 'Generating...';
+            }
+        }
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("generate-btn", "data-generating"),
+    Input("generate-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
 
 @app.callback(
     Output("status-output","children"),
