@@ -1047,7 +1047,7 @@ def on_generate(n_clicks, dispute_id):
                                   "padding":"10px 14px","marginBottom":"6px",
                                   "background":"#f8fafc","border":"1px solid #e2e8f0",
                                   "borderRadius":"8px","fontSize":"13px","cursor":"pointer"})
-                for i in range(5)
+                for i in range(4)
             ]),
         ])
 
