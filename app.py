@@ -178,13 +178,15 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None):
 
 def get_charge_history(customer_id, customer_email, limit=12):
     """Fetch prior successful charges for this customer from stripe.invoice."""
+    # LIMIT must be inlined as integer, not passed as param (Databricks rejects string LIMIT)
+    lim = int(limit)
     rows = run_query(
         "SELECT number, amount_paid, period_start, period_end, "
         "created, status, billing_reason, charge "
         "FROM " + INVOICE_TABLE + " "
         "WHERE customer = :cid AND paid = 'true' AND amount_paid > '0' "
-        "ORDER BY created DESC LIMIT :lim",
-        {"cid": customer_id, "lim": str(limit)},
+        "ORDER BY created DESC LIMIT " + str(lim),
+        {"cid": customer_id},
     )
     if not rows:
         rows = run_query(
@@ -193,8 +195,8 @@ def get_charge_history(customer_id, customer_email, limit=12):
             "FROM " + INVOICE_TABLE + " "
             "WHERE LOWER(customer_email) = LOWER(:email) "
             "AND paid = 'true' AND amount_paid > '0' "
-            "ORDER BY created DESC LIMIT :lim",
-            {"email": customer_email, "lim": str(limit)},
+            "ORDER BY created DESC LIMIT " + str(lim),
+            {"email": customer_email},
         )
     return rows or []
 
@@ -1083,12 +1085,14 @@ app.layout = html.Div([
         dcc.Download(id="dl-2"),
         dcc.Download(id="dl-3"),
         dcc.Download(id="dl-4"),
+        dcc.Download(id="dl-all"),
         dcc.Store(id="pdf-store", storage_type="memory"),
         # Buttons must exist in layout at startup for Dash to register their callbacks
-        html.Button(id="dl-btn-1", n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-2", n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-3", n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-4", n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-1",   n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-2",   n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-3",   n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-4",   n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-all", n_clicks=0, style={"display":"none"}),
 
 
 
@@ -1134,9 +1138,18 @@ def on_generate(n_clicks, dispute_id):
             ], style={"background":"#fff","border":"1px solid #e5e7eb","borderRadius":"10px",
                       "padding":"12px 16px","marginBottom":"8px"}))
 
-        # Show the 5 download buttons (pre-declared in layout, now made visible)
+        # Download All button + individual buttons
         dl_buttons = html.Div([
-            html.Div("Click to download each PDF:", style={"fontSize":"12px","color":"#6b7280","marginBottom":"8px"}),
+            html.Button(
+                "⬇  Download All (ZIP)",
+                id="dl-btn-all", n_clicks=0,
+                style={"display":"block","width":"100%","textAlign":"center",
+                       "padding":"12px 14px","marginBottom":"12px",
+                       "background":"#0f172a","color":"#f1f5f9",
+                       "border":"none","borderRadius":"8px",
+                       "fontSize":"14px","fontWeight":"700","cursor":"pointer"}
+            ),
+            html.Div("Or download individually:", style={"fontSize":"12px","color":"#6b7280","marginBottom":"8px"}),
             html.Div([
                 html.Button(str(i+1) + ". " + STRIPE_UPLOAD_CATEGORIES[i][0],
                            id="dl-btn-" + str(i+1), n_clicks=0,
@@ -1185,6 +1198,22 @@ def dl3(n, store):
               State("pdf-store","data"), prevent_initial_call=True)
 def dl4(n, store):
     return _download(n, store, 3)
+
+@app.callback(Output("dl-all","data"), Input("dl-btn-all","n_clicks"),
+              State("pdf-store","data"), prevent_initial_call=True)
+def dl_all(n, store):
+    if not store or not n:
+        return dash.no_update
+    import base64, zipfile, io as _io
+    zip_buf = _io.BytesIO()
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for fn, b64data in store.items():
+            zf.writestr(fn, base64.b64decode(b64data))
+    zip_buf.seek(0)
+    # Use first filename to derive dispute slug for the zip name
+    first_fn = list(store.keys())[0]
+    slug = first_fn.split("_1_")[0] if "_1_" in first_fn else "dispute"
+    return dcc.send_bytes(zip_buf.read(), filename=slug + "_evidence_package.zip")
 
 def _download(n, store, idx):
     if not store or not n:
