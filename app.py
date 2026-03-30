@@ -185,12 +185,15 @@ def get_account(customer_email):
         {"email": customer_email},
     )
     if not users:
-        return None, None
+        return None, None, None
     user = users[0]
+
+    # Get primary location to resolve company_id
     locs = run_query(
         "SELECT location_id, company_id, name, created_at, archived_at, "
         "active_now, tier_id, billing_source, mau "
-        "FROM " + LOCATIONS_TABLE + " WHERE owner_id = :uid",
+        "FROM " + LOCATIONS_TABLE + " WHERE owner_id = :uid "
+        "ORDER BY created_at ASC",
         {"uid": user["user_id"]},
     )
     if not locs and user.get("highest_level_location"):
@@ -200,14 +203,22 @@ def get_account(customer_email):
             "FROM " + LOCATIONS_TABLE + " WHERE location_id = :lid",
             {"lid": user["highest_level_location"]},
         )
-    return user, (locs[0] if locs else None)
+    if not locs:
+        return user, None, []
 
-def get_all_locations(company_id):
-    return run_query(
-        "SELECT location_id, name, archived_at, active_now, tier_id, billing_source "
-        "FROM " + LOCATIONS_TABLE + " WHERE company_id = :cid ORDER BY created_at ASC",
+    primary_loc = locs[0]
+    company_id  = primary_loc["company_id"]
+
+    # Get ALL locations for this company
+    all_locs = run_query(
+        "SELECT location_id, company_id, name, created_at, archived_at, "
+        "active_now, tier_id, billing_source, mau "
+        "FROM " + LOCATIONS_TABLE + " WHERE company_id = :cid "
+        "ORDER BY created_at ASC",
         {"cid": company_id},
     )
+
+    return user, primary_loc, all_locs
 
 def get_plan_history(company_id):
     return run_query(
@@ -682,7 +693,7 @@ def pdf_receipt(dispute, invoices=None):
     buf.seek(0)
     return buf.read()
 
-def pdf_service_docs(dispute, user, loc, plan_history):
+def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None):
     buf = io.BytesIO()
     doc = make_doc(buf, "Service Documentation")
     s = []
@@ -690,24 +701,40 @@ def pdf_service_docs(dispute, user, loc, plan_history):
     section_badge(s, "3.", "Service Documentation", "Service documentation", GREEN_LT, GREEN_BDR, GREEN)
     owner    = ((user.get("first_name","") + " " + user.get("last_name","")).strip() if user else "--")
     archived = loc.get("archived_at") if loc else None
-    s.append(sh("Location Status"))
+    s.append(sh("Account Overview"))
     s.append(kv_table([
-        ("Location Name", loc.get("name","--") if loc else "--"),
-        ("Location ID", str(loc.get("location_id","--")) if loc else "--"),
-        ("Company ID", str(loc.get("company_id","--")) if loc else "--"),
-        ("Owner", owner),
-        ("Account Created", fmt(loc.get("created_at")) if loc else "--"),
-        ("Archived / Canceled", "NEVER -- archived_at = NULL" if not archived else fmt(archived)),
-        ("Active Now", "YES" if loc and loc.get("active_now") else "NO"),
-        ("Tier", str(loc.get("tier_id","--")) if loc else "--"),
-        ("Billing Source", loc.get("billing_source","--") if loc else "--"),
-        ("MAU", "TRUE" if loc and loc.get("mau") else "FALSE"),
-    ]))
-    s.append(Spacer(1,10))
-    s.append(tip_box("Key evidence: archived_at = NULL and active_now = TRUE. In Homebase, a canceled "
-                     "account is marked by setting archived_at to the cancellation timestamp. The absence "
-                     "of this value confirms no cancellation was ever processed.",
-                     GREEN_LT, GREEN_BDR, GREEN))
+        ("Company ID",    str(loc.get("company_id","--")) if loc else "--"),
+        ("Owner",         owner),
+        ("Billing Source",loc.get("billing_source","--") if loc else "--"),
+    ], cw=[2.0*inch, 5.0*inch]))
+    s.append(Spacer(1, 12))
+
+    # Show all locations in a table
+    locs_to_show = all_locs if all_locs else ([loc] if loc else [])
+    s.append(sh("Locations (" + str(len(locs_to_show)) + " total)"))
+    loc_rows = []
+    for l in locs_to_show:
+        status = "Active" if not l.get("archived_at") else "Canceled " + fmt(l.get("archived_at"))
+        loc_rows.append([
+            l.get("name","--"),
+            str(l.get("location_id","--")),
+            fmt(l.get("created_at")),
+            status,
+            str(l.get("tier_id","--")),
+        ])
+    s.append(grid_table(loc_rows,
+        ["Location Name", "ID", "Created", "Status", "Tier"],
+        cw=[2.2*inch, 0.8*inch, 1.0*inch, 1.8*inch, 0.5*inch]))
+    s.append(Spacer(1, 10))
+
+    # Count never-canceled locations
+    never_canceled = [l for l in locs_to_show if not l.get("archived_at")]
+    s.append(tip_box(
+        "Key evidence: " + str(len(never_canceled)) + " of " + str(len(locs_to_show)) +
+        " location(s) have archived_at = NULL, confirming no cancellation was ever processed "
+        "for those locations. In Homebase, cancellation sets archived_at to the cancellation "
+        "timestamp. Its absence is definitive proof the account remains active.",
+        GREEN_LT, GREEN_BDR, GREEN))
     s.append(Spacer(1,12))
     s.append(sh("Owner Sign-In History"))
     if user:
@@ -900,12 +927,12 @@ def build_package(dispute_id):
     customer_email = dispute.get("customer_email")
     if not customer_email:
         raise ValueError("Dispute record has no customer_email.")
-    user, loc = get_account(customer_email)
+    user, loc, all_locs = get_account(customer_email)
     if not loc:
         raise ValueError("No Homebase account found for: " + customer_email)
     company_id    = loc["company_id"]
     plan_history  = get_plan_history(company_id)
-    all_locations = get_all_locations(company_id)
+    all_locations = all_locs  # already fetched in get_account
     created = str(dispute.get("created_at") or "")[:10]
     # Use account creation date as period start to capture all activity
     # Fall back to 12 months ago if we cant determine account age
@@ -925,7 +952,7 @@ def build_package(dispute_id):
     return {
         slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_active, all_locations),
         slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices),
-        slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history),
+        slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history, all_locations),
         slug + "_4_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
     }
 
