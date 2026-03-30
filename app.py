@@ -209,12 +209,13 @@ def get_account(customer_email):
     primary_loc = locs[0]
     company_id  = primary_loc["company_id"]
 
-    # Get ALL locations for this company
+    # Get ALL locations for this company (cap at 100 to avoid timeout on large accounts)
     all_locs = run_query(
         "SELECT location_id, company_id, name, created_at, archived_at, "
         "active_now, tier_id, billing_source, mau "
         "FROM " + LOCATIONS_TABLE + " WHERE company_id = :cid "
-        "ORDER BY created_at ASC",
+        "ORDER BY archived_at ASC NULLS FIRST, created_at ASC "
+        "LIMIT 100",
         {"cid": company_id},
     )
 
@@ -713,7 +714,7 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None):
     locs_to_show = all_locs if all_locs else ([loc] if loc else [])
     s.append(sh("Locations (" + str(len(locs_to_show)) + " total)"))
     loc_rows = []
-    for l in locs_to_show:
+    for l in locs_to_show[:100]:
         status = "Active" if not l.get("archived_at") else "Canceled " + fmt(l.get("archived_at"))
         loc_rows.append([
             l.get("name","--"),
@@ -725,6 +726,9 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None):
     s.append(grid_table(loc_rows,
         ["Location Name", "ID", "Created", "Status", "Tier"],
         cw=[2.2*inch, 0.8*inch, 1.0*inch, 1.8*inch, 0.5*inch]))
+    if len(locs_to_show) > 100:
+        s.append(Spacer(1, 4))
+        s.append(bp("... and " + str(len(locs_to_show) - 100) + " additional locations not shown."))
     s.append(Spacer(1, 10))
 
     # Count never-canceled locations
