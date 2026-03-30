@@ -959,7 +959,6 @@ app.layout = html.Div([
 
         html.Button("Generate Evidence Package", id="generate-btn", n_clicks=0,
                     disabled=False,
-                    **{"data-generating": "", "data-done": ""},
                     style={"width":"100%","padding":"13px","background":"#4f46e5","color":"#fff",
                            "border":"none","borderRadius":"8px","fontSize":"15px",
                            "fontWeight":"700","cursor":"pointer",
@@ -974,7 +973,7 @@ app.layout = html.Div([
             ],
         ),
 
-        html.Div(id="download-section", style={"marginTop":"20px"}, **{"data-clearing": ""}),
+        html.Div(id="download-section", style={"marginTop":"20px"}),
 
         dcc.Download(id="dl-1"),
         dcc.Download(id="dl-2"),
@@ -996,70 +995,10 @@ app.layout = html.Div([
           "background":"#f8fafc","minHeight":"100vh"})
 
 
-# Clientside callback - disable button instantly on click, re-enable when status updates
-app.clientside_callback(
-    """
-    function(n_clicks) {
-        if (n_clicks > 0) {
-            var btn = document.getElementById('generate-btn');
-            if (btn) {
-                btn.disabled = true;
-                btn.style.opacity = '0.5';
-                btn.style.cursor = 'not-allowed';
-                btn.innerText = 'Generating...';
-            }
-        }
-        return window.dash_clientside.no_update;
-    }
-    """,
-    Output("generate-btn", "data-generating"),
-    Input("generate-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-
-# Clear previous results instantly when generate is clicked
-app.clientside_callback(
-    """
-    function(n_clicks) {
-        if (n_clicks > 0) {
-            var section = document.getElementById('download-section');
-            if (section) section.innerHTML = '';
-            var status = document.getElementById('status-output');
-            if (status) status.innerHTML = '';
-        }
-        return window.dash_clientside.no_update;
-    }
-    """,
-    Output("download-section", "data-clearing"),
-    Input("generate-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-
-# Re-enable button when status-output changes (i.e. when generation completes)
-app.clientside_callback(
-    """
-    function(status_children) {
-        var btn = document.getElementById('generate-btn');
-        if (btn) {
-            btn.disabled = false;
-            btn.style.opacity = '1';
-            btn.style.cursor = 'pointer';
-            btn.innerText = 'Generate Evidence Package';
-        }
-        return window.dash_clientside.no_update;
-    }
-    """,
-    Output("generate-btn", "data-done"),
-    Input("status-output", "children"),
-    prevent_initial_call=True,
-)
-
 @app.callback(
     Output("status-output","children"),
     Output("download-section","children"),
     Output("pdf-store","data"),
-    Output("generate-btn","disabled"),
-    Output("generate-btn","children"),
     Input("generate-btn","n_clicks"),
     State("dispute-input","value"),
     prevent_initial_call=True,
@@ -1068,7 +1007,7 @@ def on_generate(n_clicks, dispute_id):
     if not dispute_id or not dispute_id.strip():
         return (html.Div("Please enter a dispute ID.",
                         style={"color":"#dc2626","fontSize":"13px"}),
-                [], None, False, "Generate Evidence Package")
+                [], None)
     # Clear previous results immediately so old content doesnt persist
     try:
         pdfs      = build_package(dispute_id.strip())
@@ -1111,7 +1050,7 @@ def on_generate(n_clicks, dispute_id):
         ], style={"background":"#f0fdf4","border":"1px solid #a7f3d0",
                   "borderRadius":"8px","padding":"10px 14px","marginBottom":"12px"})
 
-        return status, rows + [dl_buttons], store, False, "Generate Evidence Package"
+        return status, rows + [dl_buttons], store
 
     except Exception as e:
         return (
@@ -1119,7 +1058,7 @@ def on_generate(n_clicks, dispute_id):
                      style={"background":"#fef2f2","border":"1px solid #fecaca",
                             "borderRadius":"8px","padding":"10px 14px",
                             "color":"#991b1b","fontSize":"13px"}),
-            [], None, False, "Generate Evidence Package",
+            [], None,
         )
 
 
