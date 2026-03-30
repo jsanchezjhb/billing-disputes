@@ -973,7 +973,12 @@ app.layout = html.Div([
             ],
         ),
 
-        html.Div(id="download-section", style={"marginTop":"20px"}),
+        dcc.Loading(
+            id="loading-downloads",
+            type="default",
+            color="#4f46e5",
+            children=html.Div(id="download-section", style={"marginTop":"20px"}),
+        ),
 
         dcc.Download(id="dl-1"),
         dcc.Download(id="dl-2"),
