@@ -832,10 +832,27 @@ def pdf_policy(dispute, loc):
 
     # Embed cancellation screenshots as visual evidence
     s.append(sh("Visual Guide: How Cancellation Works in Homebase"))
-    s.append(bp("The following screenshots show the cancellation flow inside the Homebase app. "
-                "A customer must actively navigate to Settings > Plan & Billing and click "
-                "Delete Company or Submit Cancellation Request. This action was never taken "
-                "for the disputed account."))
+    # Tailor the screenshot description to the dispute reason
+    r_pol = (dispute.get("reason") or "").lower()
+    if r_pol in ("subscription_canceled", "credit_not_processed", "debit_not_authorized"):
+        screenshot_context = ("The following screenshots show the cancellation flow inside the Homebase app. "
+                              "A customer must actively navigate to Settings > Plan & Billing and click "
+                              "Delete Company or Submit Cancellation Request. No such action was ever "
+                              "taken for the disputed account.")
+    elif r_pol in ("fraudulent", "unrecognized", "debit_not_authorized"):
+        screenshot_context = ("The following screenshots show the cancellation flow inside the Homebase app. "
+                              "This demonstrates that cancellation requires a deliberate, multi-step "
+                              "in-app action by the account owner -- confirming the account was "
+                              "knowingly maintained as an active subscription.")
+    elif r_pol == "duplicate":
+        screenshot_context = ("The following screenshots show the cancellation flow inside the Homebase app. "
+                              "Each location must be canceled individually. No cancellation was submitted "
+                              "for any of the disputed locations.")
+    else:
+        screenshot_context = ("The following screenshots show the cancellation flow inside the Homebase app. "
+                              "Cancellation requires a deliberate in-app action by the account owner. "
+                              "This process was not initiated for the disputed account.")
+    s.append(bp(screenshot_context))
     s.append(Spacer(1, 10))
 
     from reportlab.platypus import Image as RLImage
@@ -942,7 +959,7 @@ app.layout = html.Div([
 
         html.Button("Generate Evidence Package", id="generate-btn", n_clicks=0,
                     disabled=False,
-                    **{"data-generating": ""},
+                    **{"data-generating": "", "data-done": ""},
                     style={"width":"100%","padding":"13px","background":"#4f46e5","color":"#fff",
                            "border":"none","borderRadius":"8px","fontSize":"15px",
                            "fontWeight":"700","cursor":"pointer",
@@ -957,7 +974,7 @@ app.layout = html.Div([
             ],
         ),
 
-        html.Div(id="download-section", style={"marginTop":"20px"}),
+        html.Div(id="download-section", style={"marginTop":"20px"}, **{"data-clearing": ""}),
 
         dcc.Download(id="dl-1"),
         dcc.Download(id="dl-2"),
@@ -979,7 +996,7 @@ app.layout = html.Div([
           "background":"#f8fafc","minHeight":"100vh"})
 
 
-# Clientside callback - fires instantly in the browser to disable button on click
+# Clientside callback - disable button instantly on click, re-enable when status updates
 app.clientside_callback(
     """
     function(n_clicks) {
@@ -997,6 +1014,43 @@ app.clientside_callback(
     """,
     Output("generate-btn", "data-generating"),
     Input("generate-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+# Clear previous results instantly when generate is clicked
+app.clientside_callback(
+    """
+    function(n_clicks) {
+        if (n_clicks > 0) {
+            var section = document.getElementById('download-section');
+            if (section) section.innerHTML = '';
+            var status = document.getElementById('status-output');
+            if (status) status.innerHTML = '';
+        }
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("download-section", "data-clearing"),
+    Input("generate-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+
+# Re-enable button when status-output changes (i.e. when generation completes)
+app.clientside_callback(
+    """
+    function(status_children) {
+        var btn = document.getElementById('generate-btn');
+        if (btn) {
+            btn.disabled = false;
+            btn.style.opacity = '1';
+            btn.style.cursor = 'pointer';
+            btn.innerText = 'Generate Evidence Package';
+        }
+        return window.dash_clientside.no_update;
+    }
+    """,
+    Output("generate-btn", "data-done"),
+    Input("status-output", "children"),
     prevent_initial_call=True,
 )
 
