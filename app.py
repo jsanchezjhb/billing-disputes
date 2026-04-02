@@ -377,6 +377,61 @@ def add_footer(story):
     story.append(Paragraph("Homebase -- joinhomebase.com | support@joinhomebase.com",
         ParagraphStyle("ft", fontName="Helvetica", fontSize=8, textColor=MUTED, alignment=TA_CENTER)))
 
+# ── Case strength signals ────────────────────────────────────────────────────
+def evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history):
+    from datetime import datetime
+    signals = {
+        "strength": "strong", "activity_level": "normal",
+        "recency_gap_days": None, "recency_gap_flag": False,
+        "low_activity_flag": False, "never_active_flag": False,
+        "prior_charges": len(charge_history) if charge_history else 0,
+        "visa_132_risk": False, "warnings": [],
+        "total_active_days": act_summary.get("total_active_days") or 0,
+    }
+    t_act = act_summary.get("total_active_days") or 0
+    if t_act == 0:
+        signals["activity_level"] = "none"
+        signals["never_active_flag"] = True
+    elif t_act <= 5:
+        signals["activity_level"] = "low"
+        signals["low_activity_flag"] = True
+    elif t_act >= 30:
+        signals["activity_level"] = "high"
+
+    charge_created = str(dispute.get("created_at") or "")[:10]
+    if last_active and last_active != "--" and charge_created and charge_created not in ("--",""):
+        try:
+            gap = (datetime.strptime(charge_created, "%Y-%m-%d").date() -
+                   datetime.strptime(last_active, "%Y-%m-%d").date()).days
+            signals["recency_gap_days"] = gap
+            if gap > 60:
+                signals["recency_gap_flag"] = True
+        except ValueError:
+            pass
+
+    reason = (dispute.get("reason") or "").lower()
+    if reason == "subscription_canceled" and (
+        signals["low_activity_flag"] or signals["never_active_flag"] or signals["recency_gap_flag"]
+    ):
+        signals["visa_132_risk"] = True
+
+    w = sum([signals["never_active_flag"], signals["low_activity_flag"], signals["recency_gap_flag"]])
+    signals["strength"] = "strong" if w == 0 else ("moderate" if w == 1 else "weak")
+
+    if signals["never_active_flag"]:   signals["warnings"].append("no_activity")
+    if signals["low_activity_flag"]:   signals["warnings"].append("low_activity")
+    if signals["recency_gap_flag"]:    signals["warnings"].append("recency_gap_" + str(signals["recency_gap_days"]))
+    if signals["visa_132_risk"]:       signals["warnings"].append("visa_132_risk")
+    return signals
+
+
+def get_strength_badge(signals):
+    s = signals.get("strength", "strong")
+    if s == "strong":   return "STRONG CASE"
+    if s == "moderate": return "MODERATE CASE -- Review flagged items"
+    return "CHALLENGING CASE -- See caveats below"
+
+
 # ── Reason-specific narrative ─────────────────────────────────────────────────
 def get_reason_content(reason, name, email, company, amount, created,
                        t_act, w_act, m_act, signins, web_si, last_active,
@@ -566,7 +621,7 @@ def get_reason_content(reason, name, email, company, amount, created,
         ]
 
 # ── PDF generators ────────────────────────────────────────────────────────────
-def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_active, all_locations=None, charge_history=None):
+def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_active, all_locations=None, charge_history=None, signals=None):
     buf = io.BytesIO()
     doc = make_doc(buf, "Dispute Narrative")
     s = []
@@ -1040,13 +1095,16 @@ def build_package(dispute_id):
     verdict = determine_verdict(dispute.get("reason"), loc.get("archived_at"), dispute.get("evidence_due_date"))
     invoices      = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"))
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
+    signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
     slug = dispute_id.replace("_","-")
-    return {
-        slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history),
+    pkg = {
+        slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals),
         slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices),
         slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history, all_locations),
         slug + "_4_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
     }
+    pkg["_signals"] = signals
+    return pkg
 
 # ── Dash app ──────────────────────────────────────────────────────────────────
 app    = dash.Dash(__name__, title="Billing Disputes Package")
@@ -1137,9 +1195,10 @@ def on_generate(n_clicks, dispute_id):
     # Clear previous results immediately so old content doesnt persist
     try:
         pdfs      = build_package(dispute_id.strip())
-        filenames = list(pdfs.keys())
         import base64
-        store = {fn: base64.b64encode(data).decode() for fn, data in pdfs.items()}
+        # Exclude _signals (not a PDF) from the download store
+        store = {fn: base64.b64encode(data).decode() for fn, data in pdfs.items() if not fn.startswith("_")}
+        filenames = list(store.keys())
 
         # Show download buttons using the pre-declared IDs in the layout
         rows = []
@@ -1179,11 +1238,40 @@ def on_generate(n_clicks, dispute_id):
             ]),
         ])
 
+        # Build signals UI from the signals dict stored in pdf package
+        sig      = pdfs.get("_signals", {})
+        strength = sig.get("strength", "strong")
+        warnings = sig.get("warnings", [])
+
+        sig_bg  = "#f0fdf4" if strength == "strong" else ("#fffbeb" if strength == "moderate" else "#fef2f2")
+        sig_bdr = "#a7f3d0" if strength == "strong" else ("#fcd34d" if strength == "moderate" else "#fecaca")
+        sig_col = "#065f46" if strength == "strong" else ("#92400e" if strength == "moderate" else "#991b1b")
+        sig_lbl = get_strength_badge(sig)
+
+        warning_items = []
+        for w in warnings:
+            if w == "no_activity":
+                warning_items.append(html.Li("No platform activity found -- consider not filing", style={"color":"#991b1b"}))
+            elif w == "low_activity":
+                warning_items.append(html.Li("Low activity (" + str(sig.get("total_active_days",0)) + " days) -- weak service delivery argument", style={"color":"#92400e"}))
+            elif w.startswith("recency_gap_"):
+                gap = w.replace("recency_gap_","")
+                warning_items.append(html.Li(gap + "-day gap between last activity and charge date", style={"color":"#92400e"}))
+            elif w == "visa_132_risk":
+                warning_items.append(html.Li("Visa 13.2 risk -- check Salesforce for phone cancellation attempts before filing", style={"color":"#991b1b","fontWeight":"600"}))
+
         status = html.Div([
-            html.Span("Package ready - ", style={"color":"#16a34a","fontWeight":"700"}),
-            html.Span(dispute_id.strip(), style={"color":"#065f46","fontSize":"13px"}),
-        ], style={"background":"#f0fdf4","border":"1px solid #a7f3d0",
-                  "borderRadius":"8px","padding":"10px 14px","marginBottom":"12px"})
+            html.Div([
+                html.Span("Package ready  |  ", style={"color":"#16a34a","fontWeight":"700"}),
+                html.Span(dispute_id.strip(), style={"color":"#065f46","fontSize":"13px"}),
+            ]),
+            html.Div([
+                html.Span("Case strength: ", style={"fontWeight":"600","fontSize":"12px"}),
+                html.Span(sig_lbl, style={"fontSize":"12px","color":sig_col,"fontWeight":"700"}),
+            ], style={"marginTop":"6px"}),
+            html.Ul(warning_items, style={"marginTop":"6px","marginBottom":"0","paddingLeft":"20px","fontSize":"12px"}) if warning_items else None,
+        ], style={"background":sig_bg,"border":"1px solid " + sig_bdr,
+                  "borderRadius":"8px","padding":"12px 14px","marginBottom":"12px"})
 
         return status, rows + [dl_buttons], store
 
