@@ -247,7 +247,7 @@ def get_account(customer_email):
 
 def get_plan_history(company_id):
     return run_query(
-        "SELECT type, start_tier, end_tier, old_subscription_type, "
+        "SELECT location_id, type, start_tier, end_tier, old_subscription_type, "
         "new_subscription_type, created_at "
         "FROM " + UPGRADES_TABLE + " WHERE company_id = :cid ORDER BY created_at DESC",
         {"cid": company_id},
@@ -830,18 +830,36 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None):
     s.append(Spacer(1,18))
     s.append(sh("Subscription & Plan Change History"))
     if plan_history:
-        rows = [[fmt(e.get("created_at")), e.get("type") or "subscription",
+        rows = [[fmt(e.get("created_at")), 
+                 str(e.get("location_id","--")),
+                 e.get("type") or "subscription",
                  str(e.get("start_tier","?")) + " to " + str(e.get("end_tier","?")),
                  str(e.get("old_subscription_type") or "--") + " to " + str(e.get("new_subscription_type") or "--")]
                 for e in plan_history]
-        s.append(grid_table(rows, ["Date","Event","Tier Change","Plan Change"],
-                            cw=[1.3*inch,1.4*inch,1.5*inch,2.8*inch]))
+        s.append(grid_table(rows, ["Date","Location ID","Event","Tier Change","Plan Change"],
+                            cw=[1.1*inch,0.9*inch,1.1*inch,1.2*inch,2.4*inch]))
     else:
         s.append(bp("No subscription change history found."))
     s.append(Spacer(1,10))
-    s.append(tip_box("Key evidence: No downgrade or cancellation events appear in the subscription "
-                     "history. The account has been continuously active since creation.",
-                     GREEN_LT, GREEN_BDR, GREEN))
+    # Dynamically summarize plan history
+    has_downgrades = any(e.get("type") == "downgrade" for e in plan_history)
+    has_cancels    = any("cancel" in str(e.get("type") or "").lower() for e in plan_history)
+    if not has_downgrades and not has_cancels:
+        plan_tip = ("Key evidence: No downgrade or cancellation events appear in the subscription "
+                    "history. The account has been continuously active since creation.")
+        tip_col = GREEN
+    elif has_downgrades and not has_cancels:
+        plan_tip = ("Note: The subscription history shows tier changes (upgrades/downgrades) "
+                    "but no cancellation events. The account has never been canceled. "
+                    "Tier changes are normal and do not indicate cancellation.")
+        tip_col = AMBER
+    else:
+        plan_tip = ("Note: The subscription history contains changes. Review the table above "
+                    "to confirm the account status at the time of the disputed charge.")
+        tip_col  = AMBER
+    tip_bg  = GREEN_LT if tip_col == GREEN else AMBER_LT
+    tip_bdr = GREEN_BDR if tip_col == GREEN else AMBER_BDR
+    s.append(tip_box(plan_tip, tip_bg, tip_bdr, tip_col))
     add_footer(s)
     doc.build(s)
     buf.seek(0)
