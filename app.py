@@ -787,11 +787,11 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None):
             str(l.get("location_id","--")),
             fmt(l.get("created_at")),
             status,
-            str(l.get("tier_id","--")),
+            tier_name(l.get("tier_id")),
         ])
     s.append(grid_table(loc_rows,
-        ["Location Name", "ID", "Created", "Status", "Tier"],
-        cw=[2.2*inch, 0.8*inch, 1.0*inch, 1.8*inch, 0.5*inch]))
+        ["Location Name", "ID", "Created", "Status", "Plan"],
+        cw=[2.2*inch, 0.8*inch, 1.0*inch, 1.6*inch, 1.2*inch]))
     if len(locs_to_show) > 100:
         s.append(Spacer(1, 4))
         s.append(bp("... and " + str(len(locs_to_show) - 100) + " additional locations not shown."))
