@@ -62,6 +62,14 @@ STRIPE_UPLOAD_CATEGORIES = [
     ("Refund and Cancellation Policy",    "Refund and cancellation policy"),
 ]
 
+TIER_NAMES = {"1": "Basic (Free)", "2": "Essentials", "3": "Plus", "4": "All-in-One",
+              1: "Basic (Free)", 2: "Essentials", 3: "Plus", 4: "All-in-One"}
+
+def tier_name(val):
+    if val is None or val == "--": return "--"
+    name = TIER_NAMES.get(val) or TIER_NAMES.get(str(val))
+    return (name + " (" + str(val) + ")") if name else str(val)
+
 # ── Connection ────────────────────────────────────────────────────────────────
 def get_conn():
     from databricks.sdk.core import Config
