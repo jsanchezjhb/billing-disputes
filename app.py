@@ -49,10 +49,11 @@ MUTED      = colors.HexColor("#6b7280")
 WHITE      = colors.white
 
 VERDICT_STYLES = {
-    "NEVER_CANCELED":         ("Active -- Never Canceled",       GREEN_LT, GREEN_BDR, GREEN),
-    "CANCELED_AFTER_PERIOD":  ("Canceled After Billing Period",  AMBER_LT, AMBER_BDR, AMBER),
-    "CANCELED_BEFORE_PERIOD": ("Canceled Before Billing Period", RED_LT,   RED_BDR,   RED),
-    "NO_DATA":                ("No Account Data Found",          INDIGO_LT, INDIGO_BDR, colors.HexColor("#1e3a5f")),
+    "NEVER_CANCELED":         ("Active -- Never Canceled",                    GREEN_LT,  GREEN_BDR,  GREEN),
+    "CANCELED_AFTER_PERIOD":  ("Canceled After Billing Period",               AMBER_LT,  AMBER_BDR,  AMBER),
+    "CANCELED_BEFORE_PERIOD": ("Canceled Before Billing Period",              RED_LT,    RED_BDR,    RED),
+    "REFUND_OWED":            ("Canceled Within 30-Day Refund Window -- CONCEDE", RED_LT, RED_BDR,   RED),
+    "NO_DATA":                ("No Account Data Found",                       INDIGO_LT, INDIGO_BDR, colors.HexColor("#1e3a5f")),
 }
 
 STRIPE_UPLOAD_CATEGORIES = [
@@ -291,7 +292,7 @@ def get_activity(company_id, period_start, period_end):
         fmt(last[0]["last_date"]) if last and last[0].get("last_date") else "--",
     )
 
-def determine_verdict(reason, archived_at, evidence_due_date):
+def determine_verdict(reason, archived_at, evidence_due_date, dispute_created=None):
     r = (reason or "").lower()
     if r in ("fraudulent","debit_not_authorized","unrecognized",
              "bank_cannot_process","insufficient_funds","incorrect_account_details"):
@@ -300,7 +301,22 @@ def determine_verdict(reason, archived_at, evidence_due_date):
         return "NEVER_CANCELED"
     arch = fmt(archived_at)
     due  = fmt(evidence_due_date) if evidence_due_date else "9999-12-31"
-    return "CANCELED_AFTER_PERIOD" if arch > due else "CANCELED_BEFORE_PERIOD"
+    if arch > due:
+        return "CANCELED_AFTER_PERIOD"
+    # Canceled before or on evidence due date -- check if within 30-day refund window
+    # Refund window: canceled within 30 days of the charge date
+    charge_date = fmt(dispute_created) if dispute_created else due
+    if charge_date and charge_date not in ("--",""):
+        try:
+            from datetime import datetime
+            arch_dt   = datetime.strptime(arch, "%Y-%m-%d").date()
+            charge_dt = datetime.strptime(charge_date, "%Y-%m-%d").date()
+            days_after_charge = (arch_dt - charge_dt).days
+            if 0 <= days_after_charge <= 30:
+                return "REFUND_OWED"
+        except ValueError:
+            pass
+    return "CANCELED_BEFORE_PERIOD"
 
 # ── PDF utilities ─────────────────────────────────────────────────────────────
 def make_doc(buf, title):
@@ -433,6 +449,10 @@ def evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active,
     return signals
 
 
+def check_refund_owed(verdict):
+    return verdict == "REFUND_OWED"
+
+
 def get_strength_badge(signals):
     s = signals.get("strength", "strong")
     if s == "strong":   return "STRONG CASE"
@@ -443,10 +463,21 @@ def get_strength_badge(signals):
 # ── Reason-specific narrative ─────────────────────────────────────────────────
 def get_reason_content(reason, name, email, company, amount, created,
                        t_act, w_act, m_act, signins, web_si, last_active,
-                       all_locations=None, dispute=None, user=None):
+                       all_locations=None, dispute=None, user=None, verdict=None):
     r = (reason or "general").lower()
 
     if r == "subscription_canceled":
+        if verdict == "REFUND_OWED":
+            return [
+                "After reviewing this dispute, our records confirm that the account owner "
+                "canceled their Homebase subscription within 30 days of the disputed charge of "
+                + amount + ". Under Homebase's refund policy, customers who cancel within 30 days "
+                "of a charge are entitled to a full refund of that charge.",
+                "The account (\"" + company + "\") was canceled on the date recorded in our system, "
+                "which falls within the 30-day refund window for the charge dated in this dispute. "
+                "This meets the criteria for a full refund under our stated policy.",
+                "We are accepting this dispute and issuing a full refund of " + amount + " to the customer.",
+            ]
         return [
             "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
             "citing \"Subscription Canceled.\" Our records demonstrate that no cancellation "
@@ -657,7 +688,7 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
         last_active = fmt(best_last_active)
     paras = get_reason_content(dispute.get("reason"), name, email, company, amount, created,
                                t_act, w_act, m_act, signins, web_si, last_active,
-                               all_locations, dispute, user)
+                               all_locations, dispute, user, verdict)
     for p in paras:
         s.append(bp(p))
         s.append(Spacer(1,6))
@@ -1100,7 +1131,7 @@ def build_package(dispute_id):
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
     act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
-    verdict = determine_verdict(dispute.get("reason"), loc.get("archived_at"), dispute.get("evidence_due_date"))
+    verdict = determine_verdict(dispute.get("reason"), loc.get("archived_at"), dispute.get("evidence_due_date"), dispute.get("created_at"))
     invoices      = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"))
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
@@ -1111,7 +1142,9 @@ def build_package(dispute_id):
         slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history, all_locations),
         slug + "_4_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
     }
-    pkg["_signals"] = signals
+    pkg["_signals"]     = signals
+    pkg["_verdict"]     = verdict
+    pkg["_archived_at"] = fmt(loc.get("archived_at")) if loc else "--"
     return pkg
 
 # ── Dash app ──────────────────────────────────────────────────────────────────
@@ -1250,36 +1283,52 @@ def on_generate(n_clicks, dispute_id):
         sig      = pdfs.get("_signals", {})
         strength = sig.get("strength", "strong")
         warnings = sig.get("warnings", [])
+        verdict  = pdfs.get("_verdict", "NEVER_CANCELED")
 
-        sig_bg  = "#f0fdf4" if strength == "strong" else ("#fffbeb" if strength == "moderate" else "#fef2f2")
-        sig_bdr = "#a7f3d0" if strength == "strong" else ("#fcd34d" if strength == "moderate" else "#fecaca")
-        sig_col = "#065f46" if strength == "strong" else ("#92400e" if strength == "moderate" else "#991b1b")
-        sig_lbl = get_strength_badge(sig)
+        # Check if we should concede
+        if verdict == "REFUND_OWED":
+            archived = pdfs.get("_archived_at","--")
+            status = html.Div([
+                html.Div("⚠ ACCEPT THIS DISPUTE",
+                         style={"fontWeight":"800","fontSize":"16px","color":"#991b1b","marginBottom":"8px"}),
+                html.Div("This account was canceled within the 30-day refund window.",
+                         style={"fontSize":"13px","color":"#991b1b","marginBottom":"4px"}),
+                html.Div("Cancellation date: " + str(archived),
+                         style={"fontSize":"13px","color":"#7f1d1d","marginBottom":"4px"}),
+                html.Div("Action required: Issue a full refund and accept the dispute in Stripe.",
+                         style={"fontSize":"13px","fontWeight":"600","color":"#7f1d1d"}),
+            ], style={"background":"#fef2f2","border":"2px solid #f87171",
+                      "borderRadius":"8px","padding":"16px","marginBottom":"12px"})
+        else:
+            sig_bg  = "#f0fdf4" if strength == "strong" else ("#fffbeb" if strength == "moderate" else "#fef2f2")
+            sig_bdr = "#a7f3d0" if strength == "strong" else ("#fcd34d" if strength == "moderate" else "#fecaca")
+            sig_col = "#065f46" if strength == "strong" else ("#92400e" if strength == "moderate" else "#991b1b")
+            sig_lbl = get_strength_badge(sig)
 
-        warning_items = []
-        for w in warnings:
-            if w == "no_activity":
-                warning_items.append(html.Li("No platform activity found -- consider not filing", style={"color":"#991b1b"}))
-            elif w == "low_activity":
-                warning_items.append(html.Li("Low activity (" + str(sig.get("total_active_days",0)) + " days) -- weak service delivery argument", style={"color":"#92400e"}))
-            elif w.startswith("recency_gap_"):
-                gap = w.replace("recency_gap_","")
-                warning_items.append(html.Li(gap + "-day gap between last activity and charge date", style={"color":"#92400e"}))
-            elif w == "visa_132_risk":
-                warning_items.append(html.Li("Visa 13.2 risk -- check Salesforce for phone cancellation attempts before filing", style={"color":"#991b1b","fontWeight":"600"}))
+            warning_items = []
+            for w in warnings:
+                if w == "no_activity":
+                    warning_items.append(html.Li("No platform activity found -- consider not filing", style={"color":"#991b1b"}))
+                elif w == "low_activity":
+                    warning_items.append(html.Li("Low activity (" + str(sig.get("total_active_days",0)) + " days) -- weak service delivery argument", style={"color":"#92400e"}))
+                elif w.startswith("recency_gap_"):
+                    gap = w.replace("recency_gap_","")
+                    warning_items.append(html.Li(gap + "-day gap between last activity and charge date", style={"color":"#92400e"}))
+                elif w == "visa_132_risk":
+                    warning_items.append(html.Li("Visa 13.2 risk -- check Salesforce for phone cancellation attempts before filing", style={"color":"#991b1b","fontWeight":"600"}))
 
-        status = html.Div([
-            html.Div([
-                html.Span("Package ready  |  ", style={"color":"#16a34a","fontWeight":"700"}),
-                html.Span(dispute_id.strip(), style={"color":"#065f46","fontSize":"13px"}),
-            ]),
-            html.Div([
-                html.Span("Case strength: ", style={"fontWeight":"600","fontSize":"12px"}),
-                html.Span(sig_lbl, style={"fontSize":"12px","color":sig_col,"fontWeight":"700"}),
-            ], style={"marginTop":"6px"}),
-            html.Ul(warning_items, style={"marginTop":"6px","marginBottom":"0","paddingLeft":"20px","fontSize":"12px"}) if warning_items else None,
-        ], style={"background":sig_bg,"border":"1px solid " + sig_bdr,
-                  "borderRadius":"8px","padding":"12px 14px","marginBottom":"12px"})
+            status = html.Div([
+                html.Div([
+                    html.Span("Package ready  |  ", style={"color":"#16a34a","fontWeight":"700"}),
+                    html.Span(dispute_id.strip(), style={"color":"#065f46","fontSize":"13px"}),
+                ]),
+                html.Div([
+                    html.Span("Case strength: ", style={"fontWeight":"600","fontSize":"12px"}),
+                    html.Span(sig_lbl, style={"fontSize":"12px","color":sig_col,"fontWeight":"700"}),
+                ], style={"marginTop":"6px"}),
+                html.Ul(warning_items, style={"marginTop":"6px","marginBottom":"0","paddingLeft":"20px","fontSize":"12px"}) if warning_items else None,
+            ], style={"background":sig_bg,"border":"1px solid " + sig_bdr,
+                      "borderRadius":"8px","padding":"12px 14px","marginBottom":"12px"})
 
         return status, rows + [dl_buttons], store
 
