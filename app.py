@@ -305,16 +305,19 @@ def determine_verdict(reason, archived_at, evidence_due_date, dispute_created=No
         return "CANCELED_AFTER_PERIOD"
     # Canceled before or on evidence due date -- check if within 30-day refund window
     # Refund window: canceled within 30 days of the charge date
-    charge_date = fmt(dispute_created) if dispute_created else due
-    if charge_date and charge_date not in ("--",""):
+    # Use charge created_at as refund window reference
+    charge_date = fmt(dispute_created) if dispute_created else None
+    if not charge_date or charge_date == "--":
+        charge_date = due
+    if arch and charge_date and arch not in ("--","") and charge_date not in ("--",""):
         try:
             from datetime import datetime
-            arch_dt   = datetime.strptime(arch, "%Y-%m-%d").date()
-            charge_dt = datetime.strptime(charge_date, "%Y-%m-%d").date()
+            arch_dt   = datetime.strptime(arch[:10], "%Y-%m-%d").date()
+            charge_dt = datetime.strptime(charge_date[:10], "%Y-%m-%d").date()
             days_after_charge = (arch_dt - charge_dt).days
             if 0 <= days_after_charge <= 30:
                 return "REFUND_OWED"
-        except ValueError:
+        except (ValueError, TypeError):
             pass
     return "CANCELED_BEFORE_PERIOD"
 
@@ -464,6 +467,7 @@ def get_strength_badge(signals):
 def get_reason_content(reason, name, email, company, amount, created,
                        t_act, w_act, m_act, signins, web_si, last_active,
                        all_locations=None, dispute=None, user=None, verdict=None):
+    verdict = verdict or ""
     r = (reason or "general").lower()
 
     if r == "subscription_canceled":
@@ -471,12 +475,12 @@ def get_reason_content(reason, name, email, company, amount, created,
             return [
                 "After reviewing this dispute, our records confirm that the account owner "
                 "canceled their Homebase subscription within 30 days of the disputed charge of "
-                + amount + ". Under Homebase's refund policy, customers who cancel within 30 days "
+                + str(amount or "--") + ". Under Homebase's refund policy, customers who cancel within 30 days "
                 "of a charge are entitled to a full refund of that charge.",
                 "The account (\"" + company + "\") was canceled on the date recorded in our system, "
                 "which falls within the 30-day refund window for the charge dated in this dispute. "
                 "This meets the criteria for a full refund under our stated policy.",
-                "We are accepting this dispute and issuing a full refund of " + amount + " to the customer.",
+                "We are accepting this dispute and issuing a full refund of " + str(amount or "--") + " to the customer.",
             ]
         return [
             "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
@@ -1144,7 +1148,7 @@ def build_package(dispute_id):
     }
     pkg["_signals"]     = signals
     pkg["_verdict"]     = verdict
-    pkg["_archived_at"] = fmt(loc.get("archived_at")) if loc else "--"
+    pkg["_archived_at"] = (fmt(loc.get("archived_at")) if loc else None) or "--"
     return pkg
 
 # ── Dash app ──────────────────────────────────────────────────────────────────
@@ -1283,7 +1287,7 @@ def on_generate(n_clicks, dispute_id):
         sig      = pdfs.get("_signals", {})
         strength = sig.get("strength", "strong")
         warnings = sig.get("warnings", [])
-        verdict  = pdfs.get("_verdict", "NEVER_CANCELED")
+        verdict  = pdfs.get("_verdict") or "NEVER_CANCELED"
 
         # Check if we should concede
         if verdict == "REFUND_OWED":
