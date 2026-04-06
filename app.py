@@ -1337,11 +1337,16 @@ def on_generate(n_clicks, dispute_id):
         return status, rows + [dl_buttons], store
 
     except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
         return (
-            html.Div([html.Span("Error: ", style={"fontWeight":"700"}), html.Span(str(e))],
-                     style={"background":"#fef2f2","border":"1px solid #fecaca",
-                            "borderRadius":"8px","padding":"10px 14px",
-                            "color":"#991b1b","fontSize":"13px"}),
+            html.Div([
+                html.Span("Error: ", style={"fontWeight":"700"}),
+                html.Span(str(e)),
+                html.Pre(tb, style={"fontSize":"10px","marginTop":"8px","whiteSpace":"pre-wrap"}),
+            ], style={"background":"#fef2f2","border":"1px solid #fecaca",
+                      "borderRadius":"8px","padding":"10px 14px",
+                      "color":"#991b1b","fontSize":"13px"}),
             [], None,
         )
 
