@@ -676,7 +676,7 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     s.append(tip_box("VERDICT: " + v_label + "  |  Dispute reason: " + reason_display, v_bg, v_bdr, v_col))
     s.append(Spacer(1,14))
     s.append(sh("Dispute Statement"))
-    name    = dispute.get("customer_name") or ((user.get("first_name","") + " " + user.get("last_name","")).strip() if user else "--")
+    name    = dispute.get("customer_name") or ((str(user.get("first_name") or "") + " " + str(user.get("last_name") or "")).strip() if user else "--")
     email   = dispute.get("customer_email","--")
     company = loc.get("name","--") if loc else "--"
     amount  = dispute.get("amount","--")
@@ -864,7 +864,7 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None):
     s = []
     doc_header(s, dispute["dispute_id"])
     section_badge(s, "3.", "Service Documentation", "Service documentation", GREEN_LT, GREEN_BDR, GREEN)
-    owner    = ((user.get("first_name","") + " " + user.get("last_name","")).strip() if user else "--")
+    owner    = ((str(user.get("first_name") or "") + " " + str(user.get("last_name") or "")).strip() if user else "--")
     archived = loc.get("archived_at") if loc else None
     s.append(sh("Account Overview"))
     s.append(kv_table([
@@ -1337,16 +1337,11 @@ def on_generate(n_clicks, dispute_id):
         return status, rows + [dl_buttons], store
 
     except Exception as e:
-        import traceback
-        tb = traceback.format_exc()
         return (
-            html.Div([
-                html.Span("Error: ", style={"fontWeight":"700"}),
-                html.Span(str(e)),
-                html.Pre(tb, style={"fontSize":"10px","marginTop":"8px","whiteSpace":"pre-wrap"}),
-            ], style={"background":"#fef2f2","border":"1px solid #fecaca",
-                      "borderRadius":"8px","padding":"10px 14px",
-                      "color":"#991b1b","fontSize":"13px"}),
+            html.Div([html.Span("Error: ", style={"fontWeight":"700"}), html.Span(str(e))],
+                     style={"background":"#fef2f2","border":"1px solid #fecaca",
+                            "borderRadius":"8px","padding":"10px 14px",
+                            "color":"#991b1b","fontSize":"13px"}),
             [], None,
         )
 
