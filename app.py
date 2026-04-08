@@ -263,33 +263,37 @@ def get_plan_history(company_id):
     )
 
 def get_activity(company_id, period_start, period_end):
-    # Join through locations to get company-level activity
-    # (fact_locations_by_day may not have company_id in all catalog versions)
+    # Get location IDs for this company first, then query activity by location_id
+    # This avoids relying on company_id being present in fact_locations_by_day
+    loc_id_rows = run_query(
+        "SELECT location_id FROM " + LOCATIONS_TABLE + " WHERE company_id = :cid",
+        {"cid": company_id},
+    )
+    loc_ids = [str(r["location_id"]) for r in loc_id_rows] if loc_id_rows else ["0"]
+    loc_ids_str = ", ".join(loc_ids)
+
     summary = run_query(
-        "SELECT COUNT(DISTINCT CAST(f.date AS DATE)) AS total_active_days, "
-        "COUNT(DISTINCT CASE WHEN f.web_active_on_day = 1 THEN CAST(f.date AS DATE) END) AS web_active_days, "
-        "COUNT(DISTINCT CASE WHEN f.mobile_active_on_day = 1 THEN CAST(f.date AS DATE) END) AS mobile_active_days, "
-        "COUNT(DISTINCT CASE WHEN f.scheduling_active_on_day = 1 THEN CAST(f.date AS DATE) END) AS scheduling_active_days "
-        "FROM " + ACTIVITY_TABLE + " f "
-        "JOIN " + LOCATIONS_TABLE + " l ON f.location_id = l.location_id "
-        "WHERE l.company_id = :cid AND f.date BETWEEN :start AND :end "
-        "AND f.active_on_day = 1",
-        {"cid": company_id, "start": period_start, "end": period_end},
+        "SELECT COUNT(DISTINCT CAST(date AS DATE)) AS total_active_days, "
+        "COUNT(DISTINCT CASE WHEN web_active_on_day = 1 THEN CAST(date AS DATE) END) AS web_active_days, "
+        "COUNT(DISTINCT CASE WHEN mobile_active_on_day = 1 THEN CAST(date AS DATE) END) AS mobile_active_days, "
+        "COUNT(DISTINCT CASE WHEN scheduling_active_on_day = 1 THEN CAST(date AS DATE) END) AS scheduling_active_days "
+        "FROM " + ACTIVITY_TABLE + " "
+        "WHERE location_id IN (" + loc_ids_str + ") AND date BETWEEN :start AND :end "
+        "AND active_on_day = 1",
+        {"start": period_start, "end": period_end},
     )
     dates = run_query(
-        "SELECT DISTINCT CAST(f.date AS DATE) AS active_date "
-        "FROM " + ACTIVITY_TABLE + " f "
-        "JOIN " + LOCATIONS_TABLE + " l ON f.location_id = l.location_id "
-        "WHERE l.company_id = :cid AND f.date BETWEEN :start AND :end "
-        "AND f.active_on_day = 1 ORDER BY active_date DESC",
-        {"cid": company_id, "start": period_start, "end": period_end},
+        "SELECT DISTINCT CAST(date AS DATE) AS active_date "
+        "FROM " + ACTIVITY_TABLE + " "
+        "WHERE location_id IN (" + loc_ids_str + ") AND date BETWEEN :start AND :end "
+        "AND active_on_day = 1 ORDER BY active_date DESC",
+        {"start": period_start, "end": period_end},
     )
     last = run_query(
-        "SELECT CAST(MAX(f.date) AS DATE) AS last_date "
-        "FROM " + ACTIVITY_TABLE + " f "
-        "JOIN " + LOCATIONS_TABLE + " l ON f.location_id = l.location_id "
-        "WHERE l.company_id = :cid AND f.active_on_day = 1",
-        {"cid": company_id},
+        "SELECT CAST(MAX(date) AS DATE) AS last_date "
+        "FROM " + ACTIVITY_TABLE + " "
+        "WHERE location_id IN (" + loc_ids_str + ") AND active_on_day = 1",
+        {},
     )
     return (
         summary[0] if summary else {},
