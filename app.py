@@ -263,27 +263,32 @@ def get_plan_history(company_id):
     )
 
 def get_activity(company_id, period_start, period_end):
-    # Deduplicate by date to avoid double-counting multi-location companies
+    # Join through locations to get company-level activity
+    # (fact_locations_by_day may not have company_id in all catalog versions)
     summary = run_query(
-        "SELECT COUNT(DISTINCT CAST(date AS DATE)) AS total_active_days, "
-        "COUNT(DISTINCT CASE WHEN web_active_on_day = 1 THEN CAST(date AS DATE) END) AS web_active_days, "
-        "COUNT(DISTINCT CASE WHEN mobile_active_on_day = 1 THEN CAST(date AS DATE) END) AS mobile_active_days, "
-        "COUNT(DISTINCT CASE WHEN scheduling_active_on_day = 1 THEN CAST(date AS DATE) END) AS scheduling_active_days "
-        "FROM " + ACTIVITY_TABLE + " "
-        "WHERE company_id = :cid AND date BETWEEN :start AND :end "
-        "AND active_on_day = 1",
+        "SELECT COUNT(DISTINCT CAST(f.date AS DATE)) AS total_active_days, "
+        "COUNT(DISTINCT CASE WHEN f.web_active_on_day = 1 THEN CAST(f.date AS DATE) END) AS web_active_days, "
+        "COUNT(DISTINCT CASE WHEN f.mobile_active_on_day = 1 THEN CAST(f.date AS DATE) END) AS mobile_active_days, "
+        "COUNT(DISTINCT CASE WHEN f.scheduling_active_on_day = 1 THEN CAST(f.date AS DATE) END) AS scheduling_active_days "
+        "FROM " + ACTIVITY_TABLE + " f "
+        "JOIN " + LOCATIONS_TABLE + " l ON f.location_id = l.location_id "
+        "WHERE l.company_id = :cid AND f.date BETWEEN :start AND :end "
+        "AND f.active_on_day = 1",
         {"cid": company_id, "start": period_start, "end": period_end},
     )
     dates = run_query(
-        "SELECT DISTINCT CAST(date AS DATE) AS active_date "
-        "FROM " + ACTIVITY_TABLE + " "
-        "WHERE company_id = :cid AND date BETWEEN :start AND :end "
-        "AND active_on_day = 1 ORDER BY active_date DESC",
+        "SELECT DISTINCT CAST(f.date AS DATE) AS active_date "
+        "FROM " + ACTIVITY_TABLE + " f "
+        "JOIN " + LOCATIONS_TABLE + " l ON f.location_id = l.location_id "
+        "WHERE l.company_id = :cid AND f.date BETWEEN :start AND :end "
+        "AND f.active_on_day = 1 ORDER BY active_date DESC",
         {"cid": company_id, "start": period_start, "end": period_end},
     )
     last = run_query(
-        "SELECT CAST(MAX(date) AS DATE) AS last_date "
-        "FROM " + ACTIVITY_TABLE + " WHERE company_id = :cid AND active_on_day = 1",
+        "SELECT CAST(MAX(f.date) AS DATE) AS last_date "
+        "FROM " + ACTIVITY_TABLE + " f "
+        "JOIN " + LOCATIONS_TABLE + " l ON f.location_id = l.location_id "
+        "WHERE l.company_id = :cid AND f.active_on_day = 1",
         {"cid": company_id},
     )
     return (
