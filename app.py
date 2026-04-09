@@ -531,6 +531,24 @@ def get_reason_content(reason, name, email, company, amount, created,
                 "This meets the criteria for a full refund under our stated policy.",
                 "We are accepting this dispute and issuing a full refund of " + str(amount or "--") + " to the customer.",
             ]
+        # Adjust narrative based on actual cancellation status
+        loc_archived = dispute.get("_disputed_loc_archived") if dispute else None
+        if verdict == "CANCELED_AFTER_PERIOD":
+            return [
+                "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
+                "citing \"Subscription Canceled.\" While we confirm the account was subsequently "
+                "canceled, the cancellation occurred outside the 30-day refund window for this charge.",
+                "The disputed charge of " + amount + " was billed on the charge date shown above. "
+                "The account cancellation was processed after the 30-day refund window had already closed. "
+                "Under Homebase policy, cancellations must occur within 30 days of a charge to qualify "
+                "for a refund. This cancellation did not meet that requirement.",
+                "The account was actively used on " + str(t_act) + " day(s) during its lifetime"
+                + (", with most recent activity on " + last_active if last_active != "--" else "") + ". "
+                "The account owner has " + str(signins) + " recorded sign-ins, confirming the service "
+                "was accessed and rendered during the billing period.",
+                "The charge of " + amount + " is fully valid. The cancellation occurred after the "
+                "refund window expired and no refund is owed for this billing period.",
+            ]
         return [
             "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
             "citing \"Subscription Canceled.\" Our records demonstrate that no cancellation "
@@ -946,12 +964,25 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None):
 
     # Count never-canceled locations
     never_canceled = [l for l in locs_to_show if not l.get("archived_at")]
-    s.append(tip_box(
-        "Key evidence: " + str(len(never_canceled)) + " of " + str(len(locs_to_show)) +
-        " location(s) have archived_at = NULL, confirming no cancellation was ever processed "
-        "for those locations. In Homebase, cancellation sets archived_at to the cancellation "
-        "timestamp. Its absence is definitive proof the account remains active.",
-        GREEN_LT, GREEN_BDR, GREEN))
+    all_canceled   = len(never_canceled) == 0
+
+    if all_canceled:
+        tip_text = (str(len(locs_to_show)) + " of " + str(len(locs_to_show)) +
+                    " location(s) have been canceled (archived_at is set on all locations). "
+                    "Review the verdict and charge date to determine if a refund is owed.")
+        tip_bg, tip_bdr, tip_col = AMBER_LT, AMBER_BDR, AMBER
+    elif len(never_canceled) == len(locs_to_show):
+        tip_text = ("All " + str(len(locs_to_show)) + " location(s) have archived_at = NULL, "
+                    "confirming no cancellation was ever processed. The account remains fully active.")
+        tip_bg, tip_bdr, tip_col = GREEN_LT, GREEN_BDR, GREEN
+    else:
+        tip_text = (str(len(never_canceled)) + " of " + str(len(locs_to_show)) +
+                    " location(s) remain active (archived_at = NULL). " +
+                    str(len(locs_to_show) - len(never_canceled)) +
+                    " location(s) have been canceled.")
+        tip_bg, tip_bdr, tip_col = AMBER_LT, AMBER_BDR, AMBER
+
+    s.append(tip_box(tip_text, tip_bg, tip_bdr, tip_col))
     s.append(Spacer(1,12))
     s.append(sh("Owner Sign-In History"))
     if user:
