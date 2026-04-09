@@ -185,6 +185,33 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None):
 
     return None
 
+def get_disputed_location(invoices_row, all_locs):
+    """
+    Try to identify the specific location being disputed from the invoice lines metadata.
+    Falls back to the primary location if not determinable.
+    Returns the matching location dict or None.
+    """
+    if not invoices_row or not all_locs:
+        return None
+    import json
+    lines_raw = invoices_row.get("lines")
+    if lines_raw:
+        try:
+            lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
+            data = lines.get("data", []) if isinstance(lines, dict) else []
+            for item in data:
+                meta = item.get("metadata", {}) or {}
+                loc_id = meta.get("location_id")
+                if loc_id:
+                    loc_id_int = int(loc_id)
+                    for l in all_locs:
+                        if l.get("location_id") == loc_id_int:
+                            return l
+        except (json.JSONDecodeError, ValueError, TypeError):
+            pass
+    return None
+
+
 def get_charge_history(customer_id, customer_email, limit=12):
     """Fetch prior successful charges for this customer from stripe.invoice."""
     # LIMIT must be inlined as integer, not passed as param (Databricks rejects string LIMIT)
@@ -1144,20 +1171,43 @@ def build_package(dispute_id):
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
     act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
-    verdict = determine_verdict(dispute.get("reason"), loc.get("archived_at"), dispute.get("evidence_due_date"), dispute.get("created_at"))
+    # Try to identify the specific location this charge applies to
+    disputed_loc = get_disputed_location(invoices, all_locs) or loc
+
+    verdict = determine_verdict(dispute.get("reason"), disputed_loc.get("archived_at") if disputed_loc else None,
+                                dispute.get("evidence_due_date"), dispute.get("created_at"))
     invoices      = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"))
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
     slug = dispute_id.replace("_","-")
     pkg = {
-        slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals),
+        slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals),
         slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices),
         slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history, all_locations),
         slug + "_4_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
     }
     pkg["_signals"]     = signals
     pkg["_verdict"]     = verdict
-    pkg["_archived_at"] = (fmt(loc.get("archived_at")) if loc else None) or "--"
+    pkg["_archived_at"] = (fmt(disputed_loc.get("archived_at")) if disputed_loc else None) or "--"
+
+    # Check if the disputed location needs action:
+    # Flag if it is NOT canceled OR still above Tier 1
+    needs_downgrade = []
+    dl = disputed_loc or loc
+    if dl:
+        not_canceled = not dl.get("archived_at")
+        above_tier1  = str(dl.get("tier_id","1")) != "1"
+        if not_canceled or above_tier1:
+            needs_downgrade.append({
+                "location_id": dl.get("location_id"),
+                "name":        dl.get("name","Unknown"),
+                "tier_id":     dl.get("tier_id"),
+                "company_id":  dl.get("company_id") or (loc.get("company_id") if loc else None),
+                "not_canceled": not_canceled,
+                "above_tier1":  above_tier1,
+            })
+    pkg["_needs_downgrade"] = needs_downgrade
+    pkg["_company_id"]      = loc.get("company_id") if loc else None
     return pkg
 
 # ── Dash app ──────────────────────────────────────────────────────────────────
@@ -1342,6 +1392,42 @@ def on_generate(n_clicks, dispute_id):
                 html.Ul(warning_items, style={"marginTop":"6px","marginBottom":"0","paddingLeft":"20px","fontSize":"12px"}) if warning_items else None,
             ], style={"background":sig_bg,"border":"1px solid " + sig_bdr,
                       "borderRadius":"8px","padding":"12px 14px","marginBottom":"12px"})
+
+        # Downgrade alerts
+        needs_downgrade = pdfs.get("_needs_downgrade", [])
+        if needs_downgrade:
+            dg_items = []
+            for nd in needs_downgrade:
+                company_id  = nd.get("company_id") or pdfs.get("_company_id","")
+                location_id = nd.get("location_id","")
+                admin_url   = "https://app.joinhomebase.com/admin/companies/" + str(company_id) + "/locations/" + str(location_id)
+                dg_items.append(html.Div([
+                    html.Span("ACTION REQUIRED: ",
+                              style={"fontWeight":"800","color":"#991b1b"}),
+                    html.Span(str(nd.get("name","")) + " (ID: " + str(location_id) + ") ",
+                              style={"color":"#7f1d1d"}),
+                    html.Span(
+                        ("is not canceled" if nd.get("not_canceled") else "") +
+                        (" and " if nd.get("not_canceled") and nd.get("above_tier1") else "") +
+                        ("still on " + tier_name(nd.get("tier_id")) if nd.get("above_tier1") else "") +
+                        " -- action required. ",
+                        style={"color":"#7f1d1d"}),
+                    html.A("Downgrade now →", href=admin_url, target="_blank",
+                           style={"color":"#991b1b","fontWeight":"700",
+                                  "textDecoration":"underline"}),
+                ], style={"marginBottom":"4px","fontSize":"12px"}))
+
+            status = html.Div([
+                status,
+                html.Div([
+                    html.Div("LOCATIONS REQUIRING DOWNGRADE",
+                             style={"fontWeight":"800","fontSize":"12px",
+                                    "color":"#991b1b","marginBottom":"6px",
+                                    "letterSpacing":"0.05em"}),
+                    *dg_items,
+                ], style={"background":"#fef2f2","border":"2px solid #f87171",
+                           "borderRadius":"8px","padding":"12px 14px","marginTop":"8px"}),
+            ])
 
         return status, rows + [dl_buttons], store
 
