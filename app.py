@@ -344,9 +344,13 @@ def determine_verdict(reason, archived_at, evidence_due_date, dispute_created=No
 
     if arch and reference_date and arch not in ("--","") and reference_date not in ("--",""):
         try:
-            from datetime import datetime
+            from datetime import datetime, timezone
             arch_dt = datetime.strptime(arch[:10], "%Y-%m-%d").date()
-            ref_dt  = datetime.strptime(reference_date[:10], "%Y-%m-%d").date()
+            # Handle unix timestamp or ISO string for reference date
+            ref_str = reference_date
+            if str(ref_str).lstrip("-").isdigit():
+                ref_str = datetime.fromtimestamp(int(ref_str), tz=timezone.utc).strftime("%Y-%m-%d")
+            ref_dt  = datetime.strptime(str(ref_str)[:10], "%Y-%m-%d").date()
             days_after_charge = (arch_dt - ref_dt).days
 
             if days_after_charge < 0:
@@ -1186,8 +1190,13 @@ def build_package(dispute_id):
     # Try to identify the specific location this charge applies to
     disputed_loc = get_disputed_location(invoices, all_locs) or loc
 
+    # Use invoice created date as the charge date (more accurate than dispute created_at)
+    # dispute.created_at = when dispute was FILED, not when charge occurred
+    invoice_created = invoices.get("created") if invoices else None
+    charge_date_ref = invoice_created or dispute.get("created_at")
+
     verdict = determine_verdict(dispute.get("reason"), disputed_loc.get("archived_at") if disputed_loc else None,
-                                dispute.get("evidence_due_date"), dispute.get("created_at"))
+                                dispute.get("evidence_due_date"), charge_date_ref)
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
     slug = dispute_id.replace("_","-")
     pkg = {
