@@ -1171,13 +1171,14 @@ def build_package(dispute_id):
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
     act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
+    invoices       = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"))
+    charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
+
     # Try to identify the specific location this charge applies to
     disputed_loc = get_disputed_location(invoices, all_locs) or loc
 
     verdict = determine_verdict(dispute.get("reason"), disputed_loc.get("archived_at") if disputed_loc else None,
                                 dispute.get("evidence_due_date"), dispute.get("created_at"))
-    invoices      = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"))
-    charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
     slug = dispute_id.replace("_","-")
     pkg = {
