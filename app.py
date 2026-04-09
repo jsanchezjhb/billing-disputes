@@ -1247,7 +1247,9 @@ def build_package(dispute_id):
     if dl:
         not_canceled = not dl.get("archived_at")
         above_tier1  = str(dl.get("tier_id","1")) != "1"
-        if not_canceled or above_tier1:
+        # Only flag if BOTH not canceled AND above tier 1
+        # Tier 1 is free so no downgrade needed even if not canceled
+        if not_canceled and above_tier1:
             needs_downgrade.append({
                 "location_id": dl.get("location_id"),
                 "name":        dl.get("name","Unknown"),
