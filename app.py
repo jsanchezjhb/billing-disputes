@@ -51,7 +51,7 @@ WHITE      = colors.white
 VERDICT_STYLES = {
     "NEVER_CANCELED":         ("Active -- Never Canceled",                    GREEN_LT,  GREEN_BDR,  GREEN),
     "CANCELED_AFTER_PERIOD":  ("Canceled After Billing Period",               AMBER_LT,  AMBER_BDR,  AMBER),
-    "CANCELED_BEFORE_PERIOD": ("Canceled Before Billing Period",              RED_LT,    RED_BDR,    RED),
+    "CANCELED_BEFORE_PERIOD": ("Canceled Before Charge Date -- Refund Likely Owed", RED_LT, RED_BDR, RED),
     "REFUND_OWED":            ("Canceled Within 30-Day Refund Window -- CONCEDE", RED_LT, RED_BDR,   RED),
     "NO_DATA":                ("No Account Data Found",                       INDIGO_LT, INDIGO_BDR, colors.HexColor("#1e3a5f")),
 }
@@ -336,25 +336,34 @@ def determine_verdict(reason, archived_at, evidence_due_date, dispute_created=No
     if not archived_at:
         return "NEVER_CANCELED"
     arch = fmt(archived_at)
-    due  = fmt(evidence_due_date) if evidence_due_date else "9999-12-31"
-    if arch > due:
-        return "CANCELED_AFTER_PERIOD"
-    # Canceled before or on evidence due date -- check if within 30-day refund window
-    # Refund window: canceled within 30 days of the charge date
-    # Use charge created_at as refund window reference
     charge_date = fmt(dispute_created) if dispute_created else None
-    if not charge_date or charge_date == "--":
-        charge_date = due
-    if arch and charge_date and arch not in ("--","") and charge_date not in ("--",""):
+    due  = fmt(evidence_due_date) if evidence_due_date else "9999-12-31"
+
+    # Use charge date as the reference for all window calculations
+    reference_date = charge_date if (charge_date and charge_date not in ("--","")) else due
+
+    if arch and reference_date and arch not in ("--","") and reference_date not in ("--",""):
         try:
             from datetime import datetime
-            arch_dt   = datetime.strptime(arch[:10], "%Y-%m-%d").date()
-            charge_dt = datetime.strptime(charge_date[:10], "%Y-%m-%d").date()
-            days_after_charge = (arch_dt - charge_dt).days
-            if 0 <= days_after_charge <= 30:
+            arch_dt = datetime.strptime(arch[:10], "%Y-%m-%d").date()
+            ref_dt  = datetime.strptime(reference_date[:10], "%Y-%m-%d").date()
+            days_after_charge = (arch_dt - ref_dt).days
+
+            if days_after_charge < 0:
+                # Canceled BEFORE the charge date -- we should not have charged them
                 return "REFUND_OWED"
+            elif 0 <= days_after_charge <= 30:
+                # Canceled within 30 days of charge -- within refund window
+                return "REFUND_OWED"
+            else:
+                # Canceled more than 30 days after charge -- outside refund window
+                return "CANCELED_AFTER_PERIOD"
         except (ValueError, TypeError):
             pass
+
+    # Fallback: compare arch to evidence due date
+    if arch > due:
+        return "CANCELED_AFTER_PERIOD"
     return "CANCELED_BEFORE_PERIOD"
 
 # ── PDF utilities ─────────────────────────────────────────────────────────────
