@@ -238,8 +238,8 @@ def get_charge_history(customer_id, customer_email, limit=12):
 
 def get_account(customer_email):
     users = run_query(
-        "SELECT user_id, first_name, last_name, email, last_sign_in_at, "
-        "mobile_last_used_at, mobile_last_used_info, "
+        "SELECT user_id, first_name, last_name, email, created_at, last_sign_in_at, "
+        "last_sign_in_ip, mobile_last_used_at, mobile_last_used_info, "
         "web_sign_in_count, sign_in_count, highest_level_location "
         "FROM " + USERS_TABLE + " WHERE LOWER(email) = LOWER(:email)",
         {"email": customer_email},
@@ -765,11 +765,31 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
         s.append(Spacer(1,6))
     s.append(Spacer(1,14))
     s.append(sh("Account Summary"))
+    signup_date = fmt(user.get("created_at")) if user else "--"
+    last_ip     = user.get("last_sign_in_ip") or "--" if user else "--"
+    device_info = user.get("mobile_last_used_info") or "--" if user else "--"
+    last_si_at  = fmt(user.get("last_sign_in_at")) if user else "--"
+    last_mob_at = fmt(user.get("mobile_last_used_at")) if user else "--"
+
+    # Build last activity string with IP and device
+    best_activity = last_active if last_active != "--" else (last_si_at if last_si_at != "--" else last_mob_at)
+    activity_detail = best_activity
+    if last_ip != "--":
+        activity_detail += " (IP: " + last_ip + ")"
+    if device_info != "--":
+        activity_detail += " (" + device_info + ")"
+
     s.append(kv_table([
-        ("Customer", name), ("Email", email), ("Company", company),
-        ("Dispute ID", dispute.get("dispute_id","--")), ("Amount", amount),
-        ("Reason", reason_display), ("Status", dispute.get("status","--")),
-        ("Evidence Due", fmt(dispute.get("evidence_due_date"))),
+        ("Customer",      name),
+        ("Email",         email),
+        ("Company",       company),
+        ("Signup Date",   signup_date),
+        ("Dispute ID",    dispute.get("dispute_id","--")),
+        ("Amount",        amount),
+        ("Reason",        reason_display),
+        ("Status",        dispute.get("status","--")),
+        ("Evidence Due",  fmt(dispute.get("evidence_due_date"))),
+        ("Last Activity", activity_detail),
     ]))
     # Activity logs appended directly to narrative
     s.append(Spacer(1, 20))
@@ -986,20 +1006,25 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None):
     s.append(Spacer(1,12))
     s.append(sh("Owner Sign-In History"))
     if user:
-        # Use best available last sign-in date across all fields
-        last_si = (user.get("last_sign_in_at") or
-                   user.get("mobile_last_used_at"))
-        web_si = user.get("web_sign_in_count") or 0
+        last_si = (user.get("last_sign_in_at") or user.get("mobile_last_used_at"))
+        web_si  = user.get("web_sign_in_count") or 0
+        last_ip = user.get("last_sign_in_ip")
+
+        # Build last sign-in string with IP
+        last_si_str = fmt(last_si) if last_si else "--"
+        if last_ip and last_si_str != "--":
+            last_si_str += " (IP: " + str(last_ip) + ")"
+
         signin_rows = [
-            ("Web Sign-Ins (all time)",  str(web_si)),
-            ("Last Recorded Sign-In",    fmt(last_si) if last_si else "--"),
+            ("Account Signup Date",     fmt(user.get("created_at"))),
+            ("Web Sign-Ins (all time)", str(web_si)),
+            ("Last Recorded Sign-In",   last_si_str),
         ]
         if user.get("mobile_last_used_at"):
-            mob_label = "Last Mobile Activity"
-            mob_val   = fmt(user.get("mobile_last_used_at"))
+            mob_val = fmt(user.get("mobile_last_used_at"))
             if user.get("mobile_last_used_info"):
-                mob_val = mob_val + " (" + str(user.get("mobile_last_used_info")) + ")"
-            signin_rows.append((mob_label, mob_val))
+                mob_val += " (" + str(user.get("mobile_last_used_info")) + ")"
+            signin_rows.append(("Last Mobile Activity", mob_val))
         s.append(kv_table(signin_rows))
     else:
         s.append(bp("No sign-in data available."))
