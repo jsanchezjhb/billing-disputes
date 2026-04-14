@@ -1247,12 +1247,39 @@ def build_package(dispute_id):
     disputed_loc = get_disputed_location(invoices, all_locs) or loc
 
     # Use invoice created date as the charge date (more accurate than dispute created_at)
-    # dispute.created_at = when dispute was FILED, not when charge occurred
     invoice_created = invoices.get("created") if invoices else None
     charge_date_ref = invoice_created or dispute.get("created_at")
 
-    verdict = determine_verdict(dispute.get("reason"), disputed_loc.get("archived_at") if disputed_loc else None,
-                                dispute.get("evidence_due_date"), charge_date_ref)
+    # Check if disputed location was downgraded to tier 1 within 30 days of charge
+    downgrade_within_window = False
+    downgrade_date = None
+    if disputed_loc and plan_history and charge_date_ref:
+        try:
+            from datetime import datetime, timezone
+            cdr = charge_date_ref
+            if str(cdr).lstrip("-").isdigit():
+                cdr = datetime.fromtimestamp(int(cdr), tz=timezone.utc).strftime("%Y-%m-%d")
+            charge_ref_dt = datetime.strptime(str(cdr)[:10], "%Y-%m-%d").date()
+            loc_id = str(disputed_loc.get("location_id",""))
+            for ev in plan_history:
+                if str(ev.get("location_id","")) == loc_id:
+                    if str(ev.get("end_tier","")) == "1" and ev.get("type") == "downgrade":
+                        ev_str = fmt(ev.get("created_at"))
+                        if ev_str and ev_str != "--":
+                            ev_dt = datetime.strptime(ev_str[:10], "%Y-%m-%d").date()
+                            days_after = (ev_dt - charge_ref_dt).days
+                            if 0 <= days_after <= 30:
+                                downgrade_within_window = True
+                                downgrade_date = ev_str
+                                break
+        except (ValueError, TypeError):
+            pass
+
+    if downgrade_within_window:
+        verdict = "REFUND_OWED"
+    else:
+        verdict = determine_verdict(dispute.get("reason"), disputed_loc.get("archived_at") if disputed_loc else None,
+                                    dispute.get("evidence_due_date"), charge_date_ref)
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
     slug = dispute_id.replace("_","-")
     pkg = {
@@ -1261,9 +1288,10 @@ def build_package(dispute_id):
         slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history, all_locations),
         slug + "_4_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
     }
-    pkg["_signals"]     = signals
-    pkg["_verdict"]     = verdict
-    pkg["_archived_at"] = (fmt(disputed_loc.get("archived_at")) if disputed_loc else None) or "--"
+    pkg["_signals"]               = signals
+    pkg["_verdict"]               = verdict
+    pkg["_downgrade_within_window"] = downgrade_within_window
+    pkg["_archived_at"]           = downgrade_date if downgrade_within_window else ((fmt(disputed_loc.get("archived_at")) if disputed_loc else None) or "--")
 
     # Check if the disputed location needs action:
     # Flag if it is NOT canceled OR still above Tier 1
@@ -1420,10 +1448,22 @@ def on_generate(n_clicks, dispute_id):
         ])
 
         # Build signals UI from the signals dict stored in pdf package
-        sig      = pdfs.get("_signals", {})
-        strength = sig.get("strength", "strong")
-        warnings = sig.get("warnings", [])
-        verdict  = pdfs.get("_verdict") or "NEVER_CANCELED"
+        sig        = pdfs.get("_signals", {})
+        strength   = sig.get("strength", "strong")
+        warnings   = sig.get("warnings", [])
+        verdict    = pdfs.get("_verdict") or "NEVER_CANCELED"
+        company_id = pdfs.get("_company_id","")
+        dg_flag    = pdfs.get("_downgrade_within_window", False)
+
+        admin_link = html.Div([
+            html.Span("Admin: ", style={"fontSize":"12px","color":"#6b7280"}),
+            html.A(
+                "app.joinhomebase.com/admin/companies/" + str(company_id),
+                href="https://app.joinhomebase.com/admin/companies/" + str(company_id),
+                target="_blank",
+                style={"fontSize":"12px","color":"#4f46e5","textDecoration":"underline"},
+            ),
+        ], style={"marginTop":"6px"}) if company_id else None
 
         # Check if we should concede
         if verdict == "REFUND_OWED":
@@ -1431,12 +1471,16 @@ def on_generate(n_clicks, dispute_id):
             status = html.Div([
                 html.Div("⚠ ACCEPT THIS DISPUTE",
                          style={"fontWeight":"800","fontSize":"16px","color":"#991b1b","marginBottom":"8px"}),
-                html.Div("This account was canceled within the 30-day refund window.",
-                         style={"fontSize":"13px","color":"#991b1b","marginBottom":"4px"}),
-                html.Div("Cancellation date: " + str(archived),
-                         style={"fontSize":"13px","color":"#7f1d1d","marginBottom":"4px"}),
+                html.Div(
+                    "This account was downgraded to Tier 1 within the 30-day refund window." if dg_flag
+                    else "This account was canceled within the 30-day refund window.",
+                    style={"fontSize":"13px","color":"#991b1b","marginBottom":"4px"}),
+                html.Div(
+                    ("Downgrade date: " if dg_flag else "Cancellation date: ") + str(archived),
+                    style={"fontSize":"13px","color":"#7f1d1d","marginBottom":"4px"}),
                 html.Div("Action required: Issue a full refund and accept the dispute in Stripe.",
                          style={"fontSize":"13px","fontWeight":"600","color":"#7f1d1d"}),
+            admin_link,
             ], style={"background":"#fef2f2","border":"2px solid #f87171",
                       "borderRadius":"8px","padding":"16px","marginBottom":"12px"})
         else:
@@ -1467,6 +1511,7 @@ def on_generate(n_clicks, dispute_id):
                     html.Span(sig_lbl, style={"fontSize":"12px","color":sig_col,"fontWeight":"700"}),
                 ], style={"marginTop":"6px"}),
                 html.Ul(warning_items, style={"marginTop":"6px","marginBottom":"0","paddingLeft":"20px","fontSize":"12px"}) if warning_items else None,
+            admin_link,
             ], style={"background":sig_bg,"border":"1px solid " + sig_bdr,
                       "borderRadius":"8px","padding":"12px 14px","marginBottom":"12px"})
 
