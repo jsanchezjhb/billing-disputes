@@ -1250,36 +1250,14 @@ def build_package(dispute_id):
     invoice_created = invoices.get("created") if invoices else None
     charge_date_ref = invoice_created or dispute.get("created_at")
 
-    # Check if disputed location was downgraded to tier 1 within 30 days of charge
-    downgrade_within_window = False
+    # Verdict is based solely on whether the account was actually canceled (archived_at).
+    # A downgrade to Tier 1 does NOT trigger a refund — the customer continued using the
+    # service at the paid tier through the billing period before choosing to downgrade.
+    # Only a true cancellation (archived_at set) within 30 days of the charge date triggers REFUND_OWED.
+    downgrade_within_window = False  # retained for UI/pkg metadata compatibility
     downgrade_date = None
-    if disputed_loc and plan_history and charge_date_ref:
-        try:
-            from datetime import datetime, timezone
-            cdr = charge_date_ref
-            if str(cdr).lstrip("-").isdigit():
-                cdr = datetime.fromtimestamp(int(cdr), tz=timezone.utc).strftime("%Y-%m-%d")
-            charge_ref_dt = datetime.strptime(str(cdr)[:10], "%Y-%m-%d").date()
-            loc_id = str(disputed_loc.get("location_id",""))
-            for ev in plan_history:
-                if str(ev.get("location_id","")) == loc_id:
-                    if str(ev.get("end_tier","")) == "1" and ev.get("type") == "downgrade":
-                        ev_str = fmt(ev.get("created_at"))
-                        if ev_str and ev_str != "--":
-                            ev_dt = datetime.strptime(ev_str[:10], "%Y-%m-%d").date()
-                            days_after = (ev_dt - charge_ref_dt).days
-                            if 0 <= days_after <= 30:
-                                downgrade_within_window = True
-                                downgrade_date = ev_str
-                                break
-        except (ValueError, TypeError):
-            pass
-
-    if downgrade_within_window:
-        verdict = "REFUND_OWED"
-    else:
-        verdict = determine_verdict(dispute.get("reason"), disputed_loc.get("archived_at") if disputed_loc else None,
-                                    dispute.get("evidence_due_date"), charge_date_ref)
+    verdict = determine_verdict(dispute.get("reason"), disputed_loc.get("archived_at") if disputed_loc else None,
+                                dispute.get("evidence_due_date"), charge_date_ref)
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
     slug = dispute_id.replace("_","-")
     pkg = {
@@ -1472,11 +1450,10 @@ def on_generate(n_clicks, dispute_id):
                 html.Div("⚠ ACCEPT THIS DISPUTE",
                          style={"fontWeight":"800","fontSize":"16px","color":"#991b1b","marginBottom":"8px"}),
                 html.Div(
-                    "This account was downgraded to Tier 1 within the 30-day refund window." if dg_flag
-                    else "This account was canceled within the 30-day refund window.",
+                    "This account was canceled within the 30-day refund window.",
                     style={"fontSize":"13px","color":"#991b1b","marginBottom":"4px"}),
                 html.Div(
-                    ("Downgrade date: " if dg_flag else "Cancellation date: ") + str(archived),
+                    "Cancellation date: " + str(archived),
                     style={"fontSize":"13px","color":"#7f1d1d","marginBottom":"4px"}),
                 html.Div("Action required: Issue a full refund and accept the dispute in Stripe.",
                          style={"fontSize":"13px","fontWeight":"600","color":"#7f1d1d"}),
