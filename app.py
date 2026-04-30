@@ -1269,26 +1269,26 @@ def pdf_policy(dispute, loc):
         "mandatory and cannot be bypassed."
     ))
     s.append(Spacer(1, 10))
+    from reportlab.platypus import KeepTogether
+    from PIL import Image as PILImage
     for tos_label, tos_b64 in [
         ("Web signup: Terms of Service acceptance required to create account", _TOS_WEB_IMG_B64),
         ("Mobile signup: Terms of Service acceptance required to create account", _TOS_MOB_IMG_B64),
     ]:
         if not tos_b64:
             continue
-        s.append(Paragraph("<b>" + tos_label + "</b>",
-                           ParagraphStyle("tsl", fontName="Helvetica-Bold", fontSize=9,
-                                          textColor=DARK, spaceAfter=6)))
         tos_bytes = _b64.b64decode(tos_b64)
         tos_buf   = _io.BytesIO(tos_bytes)
-        # Web screenshot is landscape-ish, mobile is portrait — use fixed width, auto height
-        from PIL import Image as PILImage
         pil_img = PILImage.open(_io.BytesIO(tos_bytes))
         orig_w, orig_h = pil_img.size
         display_w = 4.5 * inch
         display_h = display_w * (orig_h / orig_w)
         tos_img = RLImage(tos_buf, width=display_w, height=display_h)
-        s.append(tos_img)
-        s.append(Spacer(1, 14))
+        label_para = Paragraph("<b>" + tos_label + "</b>",
+                               ParagraphStyle("tsl", fontName="Helvetica-Bold", fontSize=9,
+                                              textColor=DARK, spaceAfter=6))
+        # KeepTogether ensures the label and its screenshot are never split across pages
+        s.append(KeepTogether([label_para, tos_img, Spacer(1, 14)]))
     s.append(Spacer(1, 4))
 
     s.append(Spacer(1, 4))
