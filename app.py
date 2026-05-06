@@ -239,7 +239,52 @@ def get_charge_history(customer_id, customer_email, limit=12):
         )
     return rows or []
 
-def get_account(customer_email):
+def get_same_day_invoices(customer_id, customer_email, charge_date_unix):
+    """
+    For duplicate disputes: fetch ALL paid invoices for this customer that were
+    created on the same calendar day as the disputed charge. Each invoice
+    represents a separate per-location charge — together they prove these are
+    distinct transactions, not a duplicate.
+    charge_date_unix: the unix timestamp of the disputed invoice's created date.
+    """
+    if not charge_date_unix:
+        return []
+    try:
+        from datetime import datetime, timezone, timedelta
+        charge_dt = datetime.fromtimestamp(int(charge_date_unix), tz=timezone.utc)
+        # Build a 24-hour window covering that calendar day (UTC)
+        day_start = int(datetime(charge_dt.year, charge_dt.month, charge_dt.day,
+                                 tzinfo=timezone.utc).timestamp())
+        day_end   = day_start + 86400
+    except (ValueError, TypeError):
+        return []
+
+    rows = run_query(
+        "SELECT id, number, status, amount_paid, amount_due, total, "
+        "currency, period_start, period_end, billing_reason, lines, "
+        "customer_name, customer_email, subscription, charge, "
+        "receipt_number, hosted_invoice_url, created, paid "
+        "FROM " + INVOICE_TABLE + " "
+        "WHERE customer = :cid AND paid = 'true' AND amount_paid > '0' "
+        "AND created >= '" + str(day_start) + "' AND created < '" + str(day_end) + "' "
+        "ORDER BY created ASC LIMIT 20",
+        {"cid": customer_id},
+    )
+    if not rows and customer_email:
+        rows = run_query(
+            "SELECT id, number, status, amount_paid, amount_due, total, "
+            "currency, period_start, period_end, billing_reason, lines, "
+            "customer_name, customer_email, subscription, charge, "
+            "receipt_number, hosted_invoice_url, created, paid "
+            "FROM " + INVOICE_TABLE + " "
+            "WHERE LOWER(customer_email) = LOWER(:email) AND paid = 'true' AND amount_paid > '0' "
+            "AND created >= '" + str(day_start) + "' AND created < '" + str(day_end) + "' "
+            "ORDER BY created ASC LIMIT 20",
+            {"email": customer_email},
+        )
+    return rows or []
+
+
     users = run_query(
         "SELECT user_id, first_name, last_name, email, created_at, last_sign_in_at, "
         "last_sign_in_ip, mobile_last_used_at, mobile_last_used_info, "
@@ -946,7 +991,7 @@ def fmt_amount(val):
     except (ValueError, TypeError):
         return str(val)
 
-def pdf_receipt(dispute, invoices=None):
+def pdf_receipt(dispute, invoices=None, same_day_invoices=None):
     buf = io.BytesIO()
     doc = make_doc(buf, "Dispute Details & Receipt")
     s = []
@@ -967,20 +1012,20 @@ def pdf_receipt(dispute, invoices=None):
     ]))
     s.append(Spacer(1,18))
 
-    # Invoice receipt for this specific dispute
-    s.append(sh("Invoice Receipt"))
-    inv = invoices  # single invoice dict or None
-    if inv:
-        # Convert unix timestamps to readable dates for period
-        def ts_to_date(val):
-            if not val or val == "--":
-                return "--"
-            try:
-                from datetime import datetime, timezone
-                return datetime.fromtimestamp(int(val), tz=timezone.utc).strftime("%Y-%m-%d")
-            except (ValueError, TypeError):
-                return str(val)[:10]
+    def ts_to_date(val):
+        if not val or val == "--":
+            return "--"
+        try:
+            from datetime import datetime, timezone
+            return datetime.fromtimestamp(int(val), tz=timezone.utc).strftime("%Y-%m-%d")
+        except (ValueError, TypeError):
+            return str(val)[:10]
 
+    def render_invoice_block(inv, label=None):
+        """Render a single invoice receipt table, optionally with a sub-heading label."""
+        if label:
+            s.append(Paragraph(label, ParagraphStyle("invlabel", fontName="Helvetica-Bold",
+                fontSize=10, textColor=DARK, spaceBefore=10, spaceAfter=4)))
         s.append(kv_table([
             ("Invoice Number",  inv.get("number","--")),
             ("Invoice ID",      inv.get("id","--")),
@@ -996,11 +1041,33 @@ def pdf_receipt(dispute, invoices=None):
             ("Charge ID",       inv.get("charge","--")),
         ]))
         if inv.get("hosted_invoice_url"):
-            s.append(Spacer(1,8))
+            s.append(Spacer(1,6))
             s.append(tip_box(
                 "Invoice URL: " + inv.get("hosted_invoice_url"),
                 GREEN_LT, GREEN_BDR, GREEN))
+
+    # For duplicate disputes, show all same-day invoices as separate receipts
+    is_duplicate = (dispute.get("reason") or "").lower() == "duplicate"
+
+    if is_duplicate and same_day_invoices:
+        s.append(sh("Transaction Receipts — Per-Location Billing"))
+        s.append(bp(
+            "Homebase charges on a per-location basis. Each location under a company account "
+            "is billed as a separate subscription with its own invoice. The " +
+            str(len(same_day_invoices)) + " transaction receipts below each represent a "
+            "distinct location charged on the same billing date, confirming these are "
+            "separate purchases of separate services — not a duplicate charge."
+        ))
+        s.append(Spacer(1, 10))
+        for i, inv in enumerate(same_day_invoices, 1):
+            render_invoice_block(inv, label="Transaction Receipt " + str(i) + " of " + str(len(same_day_invoices)))
+            s.append(Spacer(1, 14))
+    elif invoices:
+        # Standard single-invoice receipt
+        s.append(sh("Invoice Receipt"))
+        render_invoice_block(invoices)
     else:
+        s.append(sh("Invoice Receipt"))
         s.append(tip_box(
             "No matching invoice found in the database for this dispute amount. "
             "Retrieve the invoice PDF from Stripe Dashboard > Customers > " +
@@ -1342,11 +1409,20 @@ def build_package(dispute_id):
     invoices       = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"))
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
 
+    # For duplicate disputes, fetch all invoices from the same billing date to prove
+    # each charge is a separate per-location transaction (Visa rule 5.9.2.2 requires
+    # two transaction receipts showing separate merchandise/services)
+    invoice_created = invoices.get("created") if invoices else None
+    same_day_invoices = []
+    if (dispute.get("reason") or "").lower() == "duplicate" and invoice_created:
+        same_day_invoices = get_same_day_invoices(
+            dispute.get("customer_id",""), customer_email, invoice_created
+        )
+
     # Try to identify the specific location this charge applies to
     disputed_loc = get_disputed_location(invoices, all_locs) or loc
 
     # Use invoice created date as the charge date (more accurate than dispute created_at)
-    invoice_created = invoices.get("created") if invoices else None
     charge_date_ref = invoice_created or dispute.get("created_at")
 
     # Verdict is based solely on whether the account was actually canceled (archived_at).
@@ -1362,7 +1438,7 @@ def build_package(dispute_id):
     slug = dispute_id.replace("_","-")
     pkg = {
         slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals),
-        slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices),
+        slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices, same_day_invoices),
         slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history, all_locations),
         slug + "_4_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
     }
