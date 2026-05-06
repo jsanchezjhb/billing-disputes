@@ -241,10 +241,12 @@ def get_charge_history(customer_id, customer_email, limit=12):
 
 def get_same_day_invoices(customer_id, customer_email, charge_date_unix):
     """
-    For duplicate disputes: fetch ALL paid invoices for this customer that were
-    created on the same calendar day as the disputed charge. Each invoice
-    represents a separate per-location charge — together they prove these are
-    distinct transactions, not a duplicate.
+    For duplicate disputes: fetch ALL paid invoices for this customer within
+    a ±3 day window of the disputed charge. Widened from a strict 24-hour window
+    because duplicate disputes often arise from upgrade/proration events where
+    Stripe generates two invoices (subscription_update + subscription_cycle)
+    within a short window that may span midnight UTC or occur days apart.
+    Each invoice represents a separate per-location or per-event charge.
     charge_date_unix: the unix timestamp of the disputed invoice's created date.
     """
     if not charge_date_unix:
@@ -252,10 +254,9 @@ def get_same_day_invoices(customer_id, customer_email, charge_date_unix):
     try:
         from datetime import datetime, timezone, timedelta
         charge_dt = datetime.fromtimestamp(int(charge_date_unix), tz=timezone.utc)
-        # Build a 24-hour window covering that calendar day (UTC)
-        day_start = int(datetime(charge_dt.year, charge_dt.month, charge_dt.day,
-                                 tzinfo=timezone.utc).timestamp())
-        day_end   = day_start + 86400
+        # ±3 day window — wide enough to catch split upgrade/proration events
+        window_start = int((charge_dt - timedelta(days=3)).timestamp())
+        window_end   = int((charge_dt + timedelta(days=3)).timestamp())
     except (ValueError, TypeError):
         return []
 
@@ -266,7 +267,7 @@ def get_same_day_invoices(customer_id, customer_email, charge_date_unix):
         "receipt_number, hosted_invoice_url, created, paid "
         "FROM " + INVOICE_TABLE + " "
         "WHERE customer = :cid AND paid = 'true' AND amount_paid > '0' "
-        "AND created >= '" + str(day_start) + "' AND created < '" + str(day_end) + "' "
+        "AND created >= '" + str(window_start) + "' AND created < '" + str(window_end) + "' "
         "ORDER BY created ASC LIMIT 20",
         {"cid": customer_id},
     )
@@ -278,7 +279,7 @@ def get_same_day_invoices(customer_id, customer_email, charge_date_unix):
             "receipt_number, hosted_invoice_url, created, paid "
             "FROM " + INVOICE_TABLE + " "
             "WHERE LOWER(customer_email) = LOWER(:email) AND paid = 'true' AND amount_paid > '0' "
-            "AND created >= '" + str(day_start) + "' AND created < '" + str(day_end) + "' "
+            "AND created >= '" + str(window_start) + "' AND created < '" + str(window_end) + "' "
             "ORDER BY created ASC LIMIT 20",
             {"email": customer_email},
         )
@@ -1050,18 +1051,19 @@ def pdf_receipt(dispute, invoices=None, same_day_invoices=None):
     # For duplicate disputes, show all same-day invoices as separate receipts
     is_duplicate = (dispute.get("reason") or "").lower() == "duplicate"
 
-    if is_duplicate and same_day_invoices:
+    if is_duplicate and same_day_invoices and len(same_day_invoices) > 1:
         s.append(sh("Transaction Receipts — Per-Location Billing"))
+        count = len(same_day_invoices)
         s.append(bp(
             "Homebase charges on a per-location basis. Each location under a company account "
-            "is billed as a separate subscription with its own invoice. The " +
-            str(len(same_day_invoices)) + " transaction receipts below each represent a "
-            "distinct location charged on the same billing date, confirming these are "
-            "separate purchases of separate services — not a duplicate charge."
+            "is billed as a separate subscription with its own invoice. The " + str(count) +
+            " transaction receipts below each represent a distinct location or billing event "
+            "charged within the same billing window, confirming these are separate purchases "
+            "of separate services — not a duplicate charge."
         ))
         s.append(Spacer(1, 10))
         for i, inv in enumerate(same_day_invoices, 1):
-            render_invoice_block(inv, label="Transaction Receipt " + str(i) + " of " + str(len(same_day_invoices)))
+            render_invoice_block(inv, label="Transaction Receipt " + str(i) + " of " + str(count))
             s.append(Spacer(1, 14))
     elif invoices:
         # Standard single-invoice receipt
