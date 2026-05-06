@@ -285,6 +285,7 @@ def get_same_day_invoices(customer_id, customer_email, charge_date_unix):
     return rows or []
 
 
+def get_account(customer_email):
     users = run_query(
         "SELECT user_id, first_name, last_name, email, created_at, last_sign_in_at, "
         "last_sign_in_ip, mobile_last_used_at, mobile_last_used_info, "
