@@ -709,25 +709,51 @@ def get_reason_content(reason, name, email, company, amount, created,
         active_locs = [l for l in locs if not l.get("archived_at")]
         loc_count = len(active_locs)
         loc_names = ", ".join([str(l.get("name","Unknown")) for l in active_locs]) if active_locs else company
-        return [
-            "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
-            "citing \"Duplicate Charge.\" Our records confirm this was a single, unique, "
-            "legitimate charge and was not duplicated.",
-            "An important clarification about Homebase billing: Homebase charges on a "
-            "per-location basis, not per company. Each business location under a company "
-            "account is billed as a separate subscription. What may appear to be multiple "
-            "charges is actually each location being billed individually for its own subscription.",
-            "The account has " + str(loc_count) + " active location(s) on file: " + loc_names + ". "
-            "Each location carries its own subscription and is billed separately. The disputed "
-            "charge of " + amount + " corresponds to a single location subscription fee for one "
-            "billing period -- it is not a duplicate.",
-            "We have reviewed the full billing history for this account and can confirm "
-            "there is no duplicate charge. Each invoice covers a distinct location for a "
-            "separate, non-overlapping service period. The account has been continuously "
-            "active with " + str(t_act) + " active days logged during the disputed period.",
-            "The charge of " + amount + " is a legitimate, non-duplicated per-location "
-            "subscription billing. Full invoice history is attached as supporting documentation.",
-        ]
+
+        if loc_count <= 1:
+            # Single location — per-location billing argument doesn't apply.
+            # Flag this for manual review: the duplicate claim may be legitimate
+            # (e.g. a subscription_cycle + subscription_update fired on the same day).
+            charge_history = (dispute or {}).get("_charge_history", [])
+            return [
+                "⚠ MANUAL REVIEW REQUIRED — potential legitimate duplicate charge.",
+                "This account has only 1 active location (" + loc_names + "). The standard "
+                "per-location billing explanation does not apply here. A duplicate charge "
+                "dispute on a single-location account requires manual investigation to confirm "
+                "whether two separate charges were legitimately issued or whether one was "
+                "an error.",
+                "Action required before filing: Review the full invoice history in Stripe "
+                "Dashboard for " + email + " and confirm that the disputed charge of " + amount + " "
+                "and any charge the customer is identifying as the 'original' represent genuinely "
+                "separate billing events (e.g. a subscription renewal plus a same-day proration "
+                "from a plan upgrade). If both charges are legitimate, document the reason for "
+                "each below before submitting this evidence package.",
+                "The account has been active with " + str(t_act) + " active days logged, and the "
+                "service was actively used throughout the billing period. If the charges are "
+                "confirmed as distinct and legitimate, that activity history supports disputing. "
+                "If one charge was issued in error, it should be refunded before filing.",
+            ]
+        else:
+            # Multiple locations — explain per-location billing model
+            return [
+                "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
+                "citing \"Duplicate Charge.\" Our records confirm this was a single, unique, "
+                "legitimate charge and was not duplicated.",
+                "An important clarification about Homebase billing: Homebase charges on a "
+                "per-location basis, not per company. Each business location under a company "
+                "account is billed as a separate subscription. What may appear to be multiple "
+                "charges is actually each location being billed individually for its own subscription.",
+                "The account has " + str(loc_count) + " active location(s) on file: " + loc_names + ". "
+                "Each location carries its own subscription and is billed separately. The disputed "
+                "charge of " + amount + " corresponds to a single location subscription fee for one "
+                "billing period -- it is not a duplicate.",
+                "We have reviewed the full billing history for this account and can confirm "
+                "there is no duplicate charge. Each invoice covers a distinct location for a "
+                "separate, non-overlapping service period. The account has been continuously "
+                "active with " + str(t_act) + " active days logged during the disputed period.",
+                "The charge of " + amount + " is a legitimate, non-duplicated per-location "
+                "subscription billing. Full invoice history is attached as supporting documentation.",
+            ]
     elif r == "product_unacceptable":
         return [
             "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
@@ -999,7 +1025,7 @@ def fmt_amount(val):
     except (ValueError, TypeError):
         return str(val)
 
-def pdf_receipt(dispute, invoices=None, same_day_invoices=None):
+def pdf_receipt(dispute, invoices=None, same_day_invoices=None, active_loc_count=None):
     buf = io.BytesIO()
     doc = make_doc(buf, "Dispute Details & Receipt")
     s = []
@@ -1057,7 +1083,18 @@ def pdf_receipt(dispute, invoices=None, same_day_invoices=None):
     # For duplicate disputes, show all same-day invoices as separate receipts
     is_duplicate = (dispute.get("reason") or "").lower() == "duplicate"
 
-    if is_duplicate and same_day_invoices and len(same_day_invoices) > 1:
+    if is_duplicate and (active_loc_count or 0) <= 1:
+        s.append(sh("⚠ Manual Review Required"))
+        s.append(tip_box(
+            "This account has only 1 active location. The per-location billing explanation "
+            "does not apply. Review the invoice history below carefully — if the disputed "
+            "charge and the 'original' charge are both legitimate separate billing events "
+            "(e.g. annual renewal + same-day upgrade proration), document that before filing. "
+            "If one charge was issued in error, refund it before submitting this dispute.",
+            colors.HexColor("#fffbeb"), colors.HexColor("#fcd34d"), colors.HexColor("#92400e")))
+        s.append(Spacer(1, 10))
+
+    if is_duplicate and same_day_invoices and len(same_day_invoices) > 1 and (active_loc_count or 0) > 1:
         s.append(sh("Transaction Receipts — Per-Location Billing"))
         count = len(same_day_invoices)
         s.append(bp(
@@ -1461,7 +1498,8 @@ def _build_package_inner(dispute_id):
     slug = dispute_id.replace("_","-")
     pkg = {
         slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals),
-        slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices, same_day_invoices),
+        slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices, same_day_invoices,
+                                                                active_loc_count=len([l for l in all_locs if not l.get("archived_at")])),
         slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history, all_locations),
         slug + "_4_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
     }
