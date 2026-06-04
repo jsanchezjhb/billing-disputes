@@ -91,18 +91,24 @@ def esc(val):
         return str(val)
     return "'" + str(val).replace("'", "''") + "'"
 
-def run_query(sql_str, params=None):
+def run_query(sql_str, params=None, conn=None):
     if params:
         for key, val in params.items():
             sql_str = sql_str.replace(":" + key, esc(val))
     try:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
+        def _execute(c):
+            with c.cursor() as cur:
                 cur.execute(sql_str)
                 if cur.description is None:
                     return []
                 cols = [d[0] for d in cur.description]
                 return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        if conn is not None:
+            return _execute(conn)
+        else:
+            with get_conn() as c:
+                return _execute(c)
     except Exception as e:
         raise RuntimeError(f"Query failed: {str(e)} | SQL: {sql_str[:300]}") from e
 
@@ -1383,6 +1389,20 @@ def pdf_policy(dispute, loc):
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 def build_package(dispute_id):
+    from datetime import date, timedelta, datetime
+    # Open a single connection for the entire build — avoids 8-10 separate
+    # OAuth handshakes and warehouse cold-starts that cause spinner-forever hangs
+    with get_conn() as _conn:
+        _orig_run_query = globals()["run_query"]
+        def _run_query_with_conn(sql_str, params=None, conn=None):
+            return _orig_run_query(sql_str, params=params, conn=_conn)
+        globals()["run_query"] = _run_query_with_conn
+        try:
+            return _build_package_inner(dispute_id)
+        finally:
+            globals()["run_query"] = _orig_run_query
+
+def _build_package_inner(dispute_id):
     from datetime import date, timedelta, datetime
     dispute = get_dispute(dispute_id)
     if not dispute:
