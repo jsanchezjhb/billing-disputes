@@ -1428,16 +1428,22 @@ def pdf_policy(dispute, loc):
 def build_package(dispute_id):
     from datetime import date, timedelta, datetime
     # Open a single connection for the entire build — avoids 8-10 separate
-    # OAuth handshakes and warehouse cold-starts that cause spinner-forever hangs
-    with get_conn() as _conn:
-        _orig_run_query = globals()["run_query"]
-        def _run_query_with_conn(sql_str, params=None, conn=None):
-            return _orig_run_query(sql_str, params=params, conn=_conn)
-        globals()["run_query"] = _run_query_with_conn
+    # OAuth handshakes and warehouse cold-starts that cause spinner-forever hangs.
+    # Do NOT use `with get_conn()` — the Databricks connection context manager
+    # closes the connection on __exit__ immediately, before any queries run.
+    _conn = get_conn()
+    _orig_run_query = globals()["run_query"]
+    def _run_query_with_conn(sql_str, params=None, conn=None):
+        return _orig_run_query(sql_str, params=params, conn=_conn)
+    globals()["run_query"] = _run_query_with_conn
+    try:
+        return _build_package_inner(dispute_id)
+    finally:
+        globals()["run_query"] = _orig_run_query
         try:
-            return _build_package_inner(dispute_id)
-        finally:
-            globals()["run_query"] = _orig_run_query
+            _conn.close()
+        except Exception:
+            pass
 
 def _build_package_inner(dispute_id):
     from datetime import date, timedelta, datetime
