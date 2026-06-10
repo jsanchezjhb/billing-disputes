@@ -197,27 +197,54 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None):
 def get_disputed_location(invoices_row, all_locs):
     """
     Try to identify the specific location being disputed from the invoice lines metadata.
-    Falls back to the primary location if not determinable.
+    Collects every location_id found across all line items, preferring subscription-type
+    lines with amount > 0 (the actual billed location) over tax/invoiceitem lines.
+    Falls back to a direct DB lookup if the location_id is not in all_locs (e.g. capped).
     Returns the matching location dict or None.
     """
     if not invoices_row or not all_locs:
         return None
     import json
     lines_raw = invoices_row.get("lines")
-    if lines_raw:
-        try:
-            lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
-            data = lines.get("data", []) if isinstance(lines, dict) else []
-            for item in data:
-                meta = item.get("metadata", {}) or {}
-                loc_id = meta.get("location_id")
-                if loc_id:
-                    loc_id_int = int(loc_id)
-                    for l in all_locs:
-                        if l.get("location_id") == loc_id_int:
-                            return l
-        except (json.JSONDecodeError, ValueError, TypeError):
-            pass
+    if not lines_raw:
+        return None
+    try:
+        lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
+        data = lines.get("data", []) if isinstance(lines, dict) else []
+
+        # Collect (location_id, priority) — subscription lines with amount>0 take priority 0
+        candidates = []
+        for item in data:
+            meta = item.get("metadata", {}) or {}
+            loc_id = meta.get("location_id")
+            if loc_id:
+                item_type = item.get("type", "")
+                amount    = item.get("amount", 0) or 0
+                priority  = 0 if (item_type == "subscription" and amount > 0) else 1
+                try:
+                    candidates.append((int(loc_id), priority))
+                except (ValueError, TypeError):
+                    pass
+
+        candidates.sort(key=lambda x: x[1])
+        all_locs_by_id = {l.get("location_id"): l for l in all_locs}
+        for loc_id_int, _ in candidates:
+            if loc_id_int in all_locs_by_id:
+                return all_locs_by_id[loc_id_int]
+
+        # location_id found in invoice but not in all_locs (account > 100 locations) — fetch directly
+        if candidates:
+            rows = run_query(
+                "SELECT location_id, company_id, name, created_at, archived_at, "
+                "active_now, tier_id, billing_source, mau "
+                "FROM " + LOCATIONS_TABLE + " WHERE location_id = :lid",
+                {"lid": candidates[0][0]},
+            )
+            if rows:
+                return rows[0]
+
+    except (json.JSONDecodeError, ValueError, TypeError):
+        pass
     return None
 
 
