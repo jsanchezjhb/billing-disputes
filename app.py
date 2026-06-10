@@ -1485,8 +1485,16 @@ def _build_package_inner(dispute_id):
             dispute.get("customer_id",""), customer_email, invoice_created
         )
 
-    # Try to identify the specific location this charge applies to
-    disputed_loc = get_disputed_location(invoices, all_locs) or loc
+    # Try to identify the specific location this charge applies to from invoice lines metadata.
+    # IMPORTANT: only use the resolved location for verdict purposes. If we can't resolve it
+    # from the invoice (lines metadata missing location_id), do NOT fall back to primary_loc —
+    # primary_loc may be a different location with a different archived_at, which would produce
+    # a wrong REFUND_OWED verdict. Fall back to primary_loc only for display/PDF purposes.
+    disputed_loc_resolved = get_disputed_location(invoices, all_locs)
+    disputed_loc = disputed_loc_resolved or loc  # for PDF display/narrative only
+
+    # For verdict: only pass archived_at if we positively identified the disputed location
+    disputed_loc_archived_at = disputed_loc_resolved.get("archived_at") if disputed_loc_resolved else None
 
     # Use invoice created date as the charge date (more accurate than dispute created_at)
     charge_date_ref = invoice_created or dispute.get("created_at")
@@ -1497,7 +1505,7 @@ def _build_package_inner(dispute_id):
     # Only a true cancellation (archived_at set) within 30 days of the charge date triggers REFUND_OWED.
     downgrade_within_window = False  # retained for UI/pkg metadata compatibility
     downgrade_date = None
-    verdict = determine_verdict(dispute.get("reason"), disputed_loc.get("archived_at") if disputed_loc else None,
+    verdict = determine_verdict(dispute.get("reason"), disputed_loc_archived_at,
                                 dispute.get("evidence_due_date"), charge_date_ref)
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
     charge_is_payroll = is_payroll_invoice(invoices)
@@ -1535,7 +1543,7 @@ def _build_package_inner(dispute_id):
             })
     pkg["_needs_downgrade"] = needs_downgrade
     pkg["_company_id"]            = loc.get("company_id") if loc else None
-    pkg["_disputed_location_id"]  = (disputed_loc or loc or {}).get("location_id")
+    pkg["_disputed_location_id"]  = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
     return pkg
 
 # ── Dash app ──────────────────────────────────────────────────────────────────
