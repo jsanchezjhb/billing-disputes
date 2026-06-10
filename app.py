@@ -1557,6 +1557,9 @@ def _build_package_inner(dispute_id):
     disputed_loc_resolved = get_disputed_location(invoices, all_locs)
     disputed_loc = disputed_loc_resolved or loc  # for PDF display/narrative only
 
+    # Use invoice created date as the charge date (more accurate than dispute created_at)
+    charge_date_ref = invoice_created or dispute.get("created_at")
+
     # For verdict: use resolved location if available. If not resolved from invoice metadata,
     # fall back to the inferred location (disputed_loc) ONLY when the archived_at is clearly
     # outside the refund window — i.e. canceled more than 30 days before the charge OR more
@@ -1593,9 +1596,6 @@ def _build_package_inner(dispute_id):
             disputed_loc_id_for_activity, period_start, period_end
         )
     # else act_summary/active_dates/last_active already set from company-wide query above
-
-    # Use invoice created date as the charge date (more accurate than dispute created_at)
-    charge_date_ref = invoice_created or dispute.get("created_at")
 
     # Verdict is based solely on whether the account was actually canceled (archived_at).
     # A downgrade to Tier 1 does NOT trigger a refund — the customer continued using the
