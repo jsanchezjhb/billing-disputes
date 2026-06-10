@@ -1534,7 +1534,8 @@ def _build_package_inner(dispute_id):
                 "above_tier1":  above_tier1,
             })
     pkg["_needs_downgrade"] = needs_downgrade
-    pkg["_company_id"]      = loc.get("company_id") if loc else None
+    pkg["_company_id"]            = loc.get("company_id") if loc else None
+    pkg["_disputed_location_id"]  = (disputed_loc or loc or {}).get("location_id")
     return pkg
 
 # ── Dash app ──────────────────────────────────────────────────────────────────
@@ -1674,9 +1675,20 @@ def on_generate(n_clicks, dispute_id):
         strength   = sig.get("strength", "strong")
         warnings   = sig.get("warnings", [])
         verdict    = pdfs.get("_verdict") or "NEVER_CANCELED"
-        company_id = pdfs.get("_company_id","")
+        company_id  = pdfs.get("_company_id","")
+        disputed_location_id = pdfs.get("_disputed_location_id","")
         dg_flag    = pdfs.get("_downgrade_within_window", False)
         charge_is_payroll = pdfs.get("_charge_is_payroll", False)
+
+        location_link = html.Div([
+            html.Span("Location: ", style={"fontSize":"12px","color":"#6b7280"}),
+            html.A(
+                "app.joinhomebase.com/admin/companies/" + str(company_id) + "/locations/" + str(disputed_location_id),
+                href="https://app.joinhomebase.com/admin/companies/" + str(company_id) + "/locations/" + str(disputed_location_id),
+                target="_blank",
+                style={"fontSize":"12px","color":"#4f46e5","textDecoration":"underline"},
+            ),
+        ], style={"marginTop":"4px"}) if disputed_location_id else None
 
         admin_link = html.Div([
             html.Span("Admin: ", style={"fontSize":"12px","color":"#6b7280"}),
@@ -1703,6 +1715,7 @@ def on_generate(n_clicks, dispute_id):
                 html.Div("Action required: Issue a full refund and accept the dispute in Stripe.",
                          style={"fontSize":"13px","fontWeight":"600","color":"#7f1d1d"}),
             admin_link,
+            location_link,
             ], style={"background":"#fef2f2","border":"2px solid #f87171",
                       "borderRadius":"8px","padding":"16px","marginBottom":"12px"})
         else:
