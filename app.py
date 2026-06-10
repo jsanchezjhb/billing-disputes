@@ -138,7 +138,7 @@ def get_dispute(dispute_id):
 def get_dispute(dispute_id):
     rows = run_query(
         "SELECT dispute_id, amount, status, reason, customer_name, customer_id, "
-        "customer_email, created_at, last_updated_at, evidence_due_date, charge "
+        "customer_email, created_at, last_updated_at, evidence_due_date "
         "FROM " + DISPUTES_TABLE + " WHERE dispute_id = :did",
         {"did": dispute_id},
     )
@@ -154,10 +154,13 @@ def get_dispute(dispute_id):
 
 def get_invoice(customer_email, customer_id=None, dispute_amount=None, charge_id=None):
     """Fetch the specific invoice matching this dispute.
-    Tries charge_id first (most precise), then customer+amount as fallback.
-    Using only customer+amount fails when multiple locations are billed the
-    same amount on the same date — charge_id is the only unique identifier.
+    When multiple invoices exist for the same customer+amount+date (e.g. per-location
+    billing where 4 locations each pay $30 on the same day), fetches all candidates
+    and returns the one that has a resolvable location_id in its lines metadata.
+    Falls back to most recent if none have lines metadata.
     """
+    import json as _json
+
     amount_cents = None
     if dispute_amount:
         try:
@@ -165,22 +168,28 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None, charge_id
         except (ValueError, AttributeError):
             pass
 
-    # Primary: match by charge_id — uniquely identifies the exact transaction
-    if charge_id:
-        rows = run_query(
-            "SELECT id, number, status, amount_paid, amount_due, total, "
-            "currency, period_start, period_end, billing_reason, lines, "
-            "customer_name, customer_email, subscription, charge, "
-            "receipt_number, hosted_invoice_url, created, paid "
-            "FROM " + INVOICE_TABLE + " "
-            "WHERE charge = :chg AND paid = 'true' LIMIT 1",
-            {"chg": charge_id},
-        )
-        if rows:
+    def pick_best(rows):
+        """From a list of invoice rows, prefer the one with a location_id in lines."""
+        if not rows:
+            return None
+        if len(rows) == 1:
             return rows[0]
+        for row in rows:
+            lines_raw = row.get("lines")
+            if not lines_raw:
+                continue
+            try:
+                lines = _json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
+                data = lines.get("data", []) if isinstance(lines, dict) else []
+                for item in data:
+                    meta = item.get("metadata", {}) or {}
+                    if meta.get("location_id") and item.get("type") == "subscription" and (item.get("amount") or 0) > 0:
+                        return row
+            except (ValueError, TypeError):
+                continue
+        return rows[0]  # fallback to first if none have resolvable lines
 
-    # Secondary: match by customer_id + amount (may return wrong invoice if multiple
-    # locations billed same amount same date — only used when charge_id unavailable)
+    # Fetch all recent invoices matching customer + amount (up to 20 — same-day batch)
     if customer_id and amount_cents:
         rows = run_query(
             "SELECT id, number, status, amount_paid, amount_due, total, "
@@ -188,13 +197,13 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None, charge_id
             "customer_name, customer_email, subscription, charge, "
             "receipt_number, hosted_invoice_url, created, paid "
             "FROM " + INVOICE_TABLE + " "
-            "WHERE customer = :cid "
-            "AND amount_paid = :amt "
-            "ORDER BY created DESC LIMIT 1",
+            "WHERE customer = :cid AND amount_paid = :amt AND paid = 'true' "
+            "ORDER BY created DESC LIMIT 20",
             {"cid": customer_id, "amt": amount_cents},
         )
-        if rows:
-            return rows[0]
+        result = pick_best(rows)
+        if result:
+            return result
 
     # Fallback: match by email + amount
     if amount_cents:
@@ -204,13 +213,13 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None, charge_id
             "customer_name, customer_email, subscription, charge, "
             "receipt_number, hosted_invoice_url, created, paid "
             "FROM " + INVOICE_TABLE + " "
-            "WHERE LOWER(customer_email) = LOWER(:email) "
-            "AND amount_paid = :amt "
-            "ORDER BY created DESC LIMIT 1",
+            "WHERE LOWER(customer_email) = LOWER(:email) AND amount_paid = :amt AND paid = 'true' "
+            "ORDER BY created DESC LIMIT 20",
             {"email": customer_email, "amt": amount_cents},
         )
-        if rows:
-            return rows[0]
+        result = pick_best(rows)
+        if result:
+            return result
 
     # Last resort: most recent paid invoice for this customer
     if customer_id:
@@ -1602,8 +1611,7 @@ def _build_package_inner(dispute_id):
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
     act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
-    invoices       = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"),
-                                 charge_id=dispute.get("charge"))
+    invoices       = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"))
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
 
     # For duplicate disputes, fetch all invoices from the same billing date to prove
