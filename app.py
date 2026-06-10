@@ -635,34 +635,33 @@ def get_strength_badge(signals):
 # ── Reason-specific narrative ─────────────────────────────────────────────────
 def get_reason_content(reason, name, email, company, amount, created,
                        t_act, w_act, m_act, signins, web_si, last_active,
-                       all_locations=None, dispute=None, user=None, verdict=None):
+                       all_locations=None, dispute=None, user=None, verdict=None, loc_archived=None):
     verdict = verdict or ""
     r = (reason or "general").lower()
 
     if r == "subscription_canceled":
         if verdict == "REFUND_OWED":
             return [
-                "After reviewing this dispute, our records confirm that the account owner "
-                "canceled their Homebase subscription within 30 days of the disputed charge of "
+                "After reviewing this dispute, our records confirm that the location \""
+                + company + "\" was canceled within 30 days of the disputed charge of "
                 + str(amount or "--") + ". Under Homebase's refund policy, customers who cancel within 30 days "
                 "of a charge are entitled to a full refund of that charge.",
-                "The account (\"" + company + "\") was canceled on the date recorded in our system, "
+                "The location was canceled on " + (loc_archived or "the date recorded in our system") + ", "
                 "which falls within the 30-day refund window for the charge dated in this dispute. "
                 "This meets the criteria for a full refund under our stated policy.",
                 "We are accepting this dispute and issuing a full refund of " + str(amount or "--") + " to the customer.",
             ]
-        # Adjust narrative based on actual cancellation status
-        loc_archived = dispute.get("_disputed_loc_archived") if dispute else None
         if verdict == "CANCELED_AFTER_PERIOD":
             return [
                 "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
-                "citing \"Subscription Canceled.\" While we confirm the account was subsequently "
+                "citing \"Subscription Canceled.\" While we confirm the location was subsequently "
                 "canceled, the cancellation occurred outside the 30-day refund window for this charge.",
                 "The disputed charge of " + amount + " was billed on the charge date shown above. "
-                "The account cancellation was processed after the 30-day refund window had already closed. "
+                "The location \"" + company + "\" was canceled on " + (loc_archived or "a date after the charge") + ", "
+                "after the 30-day refund window had already closed. "
                 "Under Homebase policy, cancellations must occur within 30 days of a charge to qualify "
                 "for a refund. This cancellation did not meet that requirement.",
-                "The account was actively used on " + str(t_act) + " day(s) during its lifetime"
+                "The location was actively used on " + str(t_act) + " day(s) during its lifetime"
                 + (", with most recent activity on " + last_active if last_active != "--" else "") + ". "
                 "The account owner has " + str(signins) + " recorded sign-ins, confirming the service "
                 "was accessed and rendered during the billing period.",
@@ -672,18 +671,18 @@ def get_reason_content(reason, name, email, company, amount, created,
         return [
             "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
             "citing \"Subscription Canceled.\" Our records demonstrate that no cancellation "
-            "was ever processed through the Homebase platform for this account.",
-            "The account (\"" + company + "\") was created on " + created + " and remains fully active "
-            "and unarchived (archived_at = NULL, active_now = TRUE). Cancellation requires "
+            "was ever processed through the Homebase platform for this location.",
+            "The location (\"" + company + "\") was created on " + created + " and remains fully active "
+            "and unarchived (archived_at = NULL). Cancellation requires "
             "an affirmative in-app action via Settings > Billing & Plan > Cancel Subscription. "
-            "No such action was ever taken.",
-            "The account has been active on " + str(t_act) + " day(s) since creation"
+            "No such action was ever taken for this location.",
+            "The location has been active on " + str(t_act) + " day(s) since creation"
             + (" with most recent activity recorded on " + last_active if last_active != "--" else "") + ". "
             "The account owner has " + str(signins) + " recorded sign-ins to the platform, "
             "confirming the account has been accessed and used.",
             "Under Homebase policy, a customer must cancel within 30 days of a charge to "
             "receive a full refund. The customer did not cancel within 30 days of the "
-            "disputed charge and has never canceled at all. The charge of " + amount + " is fully "
+            "disputed charge and has never canceled this location. The charge of " + amount + " is fully "
             "valid and no refund is owed.",
         ]
     elif r == "fraudulent":
@@ -894,6 +893,10 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     company = loc.get("name","--") if loc else "--"
     amount  = dispute.get("amount","--")
     created = fmt(loc.get("created_at")) if loc else "--"
+    # Use the specific disputed location name/created for narrative context when resolved
+    loc_name    = loc.get("name","--") if loc else "--"
+    loc_created = fmt(loc.get("created_at")) if loc else "--"
+    loc_archived = fmt(loc.get("archived_at")) if (loc and loc.get("archived_at")) else None
     t_act   = act_summary.get("total_active_days") or 0
     m_act   = act_summary.get("mobile_active_days") or 0
     w_act   = act_summary.get("web_active_days") or 0
@@ -903,9 +906,9 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
                         user.get("mobile_last_used_at")) if user else None
     if best_last_active and last_active == "--":
         last_active = fmt(best_last_active)
-    paras = get_reason_content(dispute.get("reason"), name, email, company, amount, created,
+    paras = get_reason_content(dispute.get("reason"), name, email, loc_name, amount, loc_created,
                                t_act, w_act, m_act, signins, web_si, last_active,
-                               all_locations, dispute, user, verdict)
+                               all_locations, dispute, user, verdict, loc_archived=loc_archived)
     for p in paras:
         s.append(bp(p))
         s.append(Spacer(1,6))
@@ -928,7 +931,8 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     s.append(kv_table([
         ("Customer",      name),
         ("Email",         email),
-        ("Company",       company),
+        ("Location",      loc_name + (" (ID: " + str(loc.get("location_id","")) + ")" if loc and loc.get("location_id") else "")),
+        ("Location Status", ("Canceled " + loc_archived) if loc_archived else "Active (never canceled)"),
         ("Signup Date",   signup_date),
         ("Dispute ID",    dispute.get("dispute_id","--")),
         ("Amount",        amount),
@@ -1125,7 +1129,7 @@ def pdf_receipt(dispute, invoices=None, same_day_invoices=None, active_loc_count
     buf.seek(0)
     return buf.read()
 
-def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None):
+def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None, disputed_loc=None):
     buf = io.BytesIO()
     doc = make_doc(buf, "Service Documentation")
     s = []
@@ -1141,14 +1145,36 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None):
     ], cw=[2.0*inch, 5.0*inch]))
     s.append(Spacer(1, 12))
 
+    # Disputed location callout — the specific location this charge is for
+    dl = disputed_loc or loc
+    if dl:
+        dl_archived    = dl.get("archived_at")
+        dl_status      = ("Canceled " + fmt(dl_archived)) if dl_archived else "Active (never canceled)"
+        dl_status_col  = colors.HexColor("#991b1b") if dl_archived else colors.HexColor("#065f46")
+        dl_bg          = colors.HexColor("#fef2f2") if dl_archived else colors.HexColor("#f0fdf4")
+        dl_bdr         = colors.HexColor("#fecaca") if dl_archived else colors.HexColor("#a7f3d0")
+        s.append(sh("Disputed Location"))
+        s.append(tip_box(
+            "This dispute is for location: \"" + str(dl.get("name","--")) + "\"  "
+            "(ID: " + str(dl.get("location_id","--")) + ")  |  "
+            "Status: " + dl_status + "  |  "
+            "Plan: " + tier_name(dl.get("tier_id")) + "  |  "
+            "Created: " + fmt(dl.get("created_at")) +
+            ("" if disputed_loc else "  ⚠ location inferred — could not resolve from invoice metadata"),
+            dl_bg, dl_bdr, dl_status_col
+        ))
+        s.append(Spacer(1, 12))
+
     # Show all locations in a table
     locs_to_show = all_locs if all_locs else ([loc] if loc else [])
     s.append(sh("Locations (" + str(len(locs_to_show)) + " total)"))
     loc_rows = []
+    disputed_loc_id = dl.get("location_id") if dl else None
     for l in locs_to_show[:100]:
-        status = "Active" if not l.get("archived_at") else "Canceled " + fmt(l.get("archived_at"))
+        is_disputed = l.get("location_id") == disputed_loc_id
+        status = ("★ DISPUTED — " if is_disputed else "") + ("Active" if not l.get("archived_at") else "Canceled " + fmt(l.get("archived_at")))
         loc_rows.append([
-            l.get("name","--"),
+            ("★ " if is_disputed else "") + str(l.get("name","--")),
             str(l.get("location_id","--")),
             fmt(l.get("created_at")),
             status,
@@ -1166,21 +1192,31 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None):
     never_canceled = [l for l in locs_to_show if not l.get("archived_at")]
     all_canceled   = len(never_canceled) == 0
 
+    # Disputed location status for tip context
+    dl_archived_tip = dl.get("archived_at") if dl else None
+    dl_name_tip     = dl.get("name","the disputed location") if dl else "the disputed location"
+    disputed_status_note = (
+        " The disputed location (\"" + dl_name_tip + "\") is CANCELED (archived_at = " + fmt(dl_archived_tip) + ")."
+        if dl_archived_tip else
+        " The disputed location (\"" + dl_name_tip + "\") is ACTIVE (archived_at = NULL)."
+    ) if dl else ""
+
     if all_canceled:
         tip_text = (str(len(locs_to_show)) + " of " + str(len(locs_to_show)) +
-                    " location(s) have been canceled (archived_at is set on all locations). "
-                    "Review the verdict and charge date to determine if a refund is owed.")
+                    " location(s) have been canceled." + disputed_status_note)
         tip_bg, tip_bdr, tip_col = AMBER_LT, AMBER_BDR, AMBER
     elif len(never_canceled) == len(locs_to_show):
-        tip_text = ("All " + str(len(locs_to_show)) + " location(s) have archived_at = NULL, "
-                    "confirming no cancellation was ever processed. The account remains fully active.")
+        tip_text = ("All " + str(len(locs_to_show)) + " location(s) have archived_at = NULL." +
+                    disputed_status_note)
         tip_bg, tip_bdr, tip_col = GREEN_LT, GREEN_BDR, GREEN
     else:
         tip_text = (str(len(never_canceled)) + " of " + str(len(locs_to_show)) +
-                    " location(s) remain active (archived_at = NULL). " +
+                    " location(s) remain active. " +
                     str(len(locs_to_show) - len(never_canceled)) +
-                    " location(s) have been canceled.")
-        tip_bg, tip_bdr, tip_col = AMBER_LT, AMBER_BDR, AMBER
+                    " location(s) have been canceled." + disputed_status_note)
+        tip_bg  = colors.HexColor("#fef2f2") if dl_archived_tip else AMBER_LT
+        tip_bdr = colors.HexColor("#fecaca") if dl_archived_tip else AMBER_BDR
+        tip_col = colors.HexColor("#991b1b") if dl_archived_tip else AMBER
 
     s.append(tip_box(tip_text, tip_bg, tip_bdr, tip_col))
     s.append(Spacer(1,12))
@@ -1514,7 +1550,7 @@ def _build_package_inner(dispute_id):
         slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals),
         slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices, same_day_invoices,
                                                                 active_loc_count=len([l for l in all_locs if not l.get("archived_at")])),
-        slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history, all_locations),
+        slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history, all_locations, disputed_loc=disputed_loc_resolved),
         slug + "_4_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
     }
     pkg["_signals"]               = signals
@@ -1544,6 +1580,8 @@ def _build_package_inner(dispute_id):
     pkg["_needs_downgrade"] = needs_downgrade
     pkg["_company_id"]            = loc.get("company_id") if loc else None
     pkg["_disputed_location_id"]  = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
+    pkg["_disputed_location_name"] = (disputed_loc_resolved or disputed_loc or {}).get("name","")
+    pkg["_disputed_loc_resolved"] = disputed_loc_resolved is not None
     return pkg
 
 # ── Dash app ──────────────────────────────────────────────────────────────────
@@ -1683,20 +1721,12 @@ def on_generate(n_clicks, dispute_id):
         strength   = sig.get("strength", "strong")
         warnings   = sig.get("warnings", [])
         verdict    = pdfs.get("_verdict") or "NEVER_CANCELED"
-        company_id  = pdfs.get("_company_id","")
+        company_id           = pdfs.get("_company_id","")
         disputed_location_id = pdfs.get("_disputed_location_id","")
-        dg_flag    = pdfs.get("_downgrade_within_window", False)
-        charge_is_payroll = pdfs.get("_charge_is_payroll", False)
-
-        location_link = html.Div([
-            html.Span("Location: ", style={"fontSize":"12px","color":"#6b7280"}),
-            html.A(
-                "app.joinhomebase.com/admin/companies/" + str(company_id) + "/locations/" + str(disputed_location_id),
-                href="https://app.joinhomebase.com/admin/companies/" + str(company_id) + "/locations/" + str(disputed_location_id),
-                target="_blank",
-                style={"fontSize":"12px","color":"#4f46e5","textDecoration":"underline"},
-            ),
-        ], style={"marginTop":"4px"}) if disputed_location_id else None
+        disputed_loc_name    = pdfs.get("_disputed_location_name","")
+        loc_resolved         = pdfs.get("_disputed_loc_resolved", False)
+        dg_flag              = pdfs.get("_downgrade_within_window", False)
+        charge_is_payroll    = pdfs.get("_charge_is_payroll", False)
 
         admin_link = html.Div([
             html.Span("Admin: ", style={"fontSize":"12px","color":"#6b7280"}),
@@ -1706,7 +1736,25 @@ def on_generate(n_clicks, dispute_id):
                 target="_blank",
                 style={"fontSize":"12px","color":"#4f46e5","textDecoration":"underline"},
             ),
-        ], style={"marginTop":"6px"}) if company_id else None
+        ], style={"marginTop":"4px"}) if company_id else None
+
+        location_link = html.Div([
+            html.Span("Location: ", style={"fontSize":"12px","color":"#6b7280"}),
+            html.A(
+                "app.joinhomebase.com/admin/companies/" + str(company_id) + "/locations/" + str(disputed_location_id),
+                href="https://app.joinhomebase.com/admin/companies/" + str(company_id) + "/locations/" + str(disputed_location_id),
+                target="_blank",
+                style={"fontSize":"12px","color":"#4f46e5","textDecoration":"underline"},
+            ),
+            html.Span(
+                " (" + disputed_loc_name + ")" if disputed_loc_name else "",
+                style={"fontSize":"12px","color":"#6b7280"}
+            ),
+            html.Span(
+                "  ⚠ location not resolved from invoice — verify manually",
+                style={"fontSize":"11px","color":"#b45309","marginLeft":"6px"}
+            ) if not loc_resolved else None,
+        ], style={"marginTop":"4px"}) if disputed_location_id else None
 
         # Check if we should concede
         if verdict == "REFUND_OWED":
@@ -1755,6 +1803,7 @@ def on_generate(n_clicks, dispute_id):
                 ], style={"marginTop":"6px"}),
                 html.Ul(warning_items, style={"marginTop":"6px","marginBottom":"0","paddingLeft":"20px","fontSize":"12px"}) if warning_items else None,
             admin_link,
+            location_link,
             ], style={"background":sig_bg,"border":"1px solid " + sig_bdr,
                       "borderRadius":"8px","padding":"12px 14px","marginBottom":"12px"})
 
