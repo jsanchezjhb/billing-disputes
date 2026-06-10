@@ -345,7 +345,39 @@ def get_plan_history(company_id):
         {"cid": company_id},
     )
 
-def get_payroll_status(company_id):
+def get_activity_for_location(location_id, period_start, period_end):
+    """Activity query scoped to a single location — avoids inflating stats across multi-location accounts."""
+    lid = str(location_id)
+    summary = run_query(
+        "SELECT COUNT(DISTINCT CAST(date AS DATE)) AS total_active_days, "
+        "COUNT(DISTINCT CASE WHEN web_active_on_day = 1 THEN CAST(date AS DATE) END) AS web_active_days, "
+        "COUNT(DISTINCT CASE WHEN mobile_active_on_day = 1 THEN CAST(date AS DATE) END) AS mobile_active_days, "
+        "COUNT(DISTINCT CASE WHEN scheduling_active_on_day = 1 THEN CAST(date AS DATE) END) AS scheduling_active_days "
+        "FROM " + ACTIVITY_TABLE + " "
+        "WHERE location_id = " + lid + " AND date BETWEEN :start AND :end "
+        "AND active_on_day = 1",
+        {"start": period_start, "end": period_end},
+    )
+    dates = run_query(
+        "SELECT DISTINCT CAST(date AS DATE) AS active_date "
+        "FROM " + ACTIVITY_TABLE + " "
+        "WHERE location_id = " + lid + " AND date BETWEEN :start AND :end "
+        "AND active_on_day = 1 ORDER BY active_date DESC",
+        {"start": period_start, "end": period_end},
+    )
+    last = run_query(
+        "SELECT CAST(MAX(date) AS DATE) AS last_date "
+        "FROM " + ACTIVITY_TABLE + " "
+        "WHERE location_id = " + lid + " AND active_on_day = 1",
+        {},
+    )
+    return (
+        summary[0] if summary else {},
+        [fmt(r["active_date"]) for r in dates],
+        fmt(last[0]["last_date"]) if last and last[0].get("last_date") else "--",
+    )
+
+
     """
     Returns a dict describing whether the company has an active payroll subscription.
     payroll_state values:
@@ -1522,15 +1554,45 @@ def _build_package_inner(dispute_id):
         )
 
     # Try to identify the specific location this charge applies to from invoice lines metadata.
-    # IMPORTANT: only use the resolved location for verdict purposes. If we can't resolve it
-    # from the invoice (lines metadata missing location_id), do NOT fall back to primary_loc —
-    # primary_loc may be a different location with a different archived_at, which would produce
-    # a wrong REFUND_OWED verdict. Fall back to primary_loc only for display/PDF purposes.
     disputed_loc_resolved = get_disputed_location(invoices, all_locs)
     disputed_loc = disputed_loc_resolved or loc  # for PDF display/narrative only
 
-    # For verdict: only pass archived_at if we positively identified the disputed location
-    disputed_loc_archived_at = disputed_loc_resolved.get("archived_at") if disputed_loc_resolved else None
+    # For verdict: use resolved location if available. If not resolved from invoice metadata,
+    # fall back to the inferred location (disputed_loc) ONLY when the archived_at is clearly
+    # outside the refund window — i.e. canceled more than 30 days before the charge OR more
+    # than 30 days after. We never infer REFUND_OWED (too high stakes) — only CANCELED_AFTER_PERIOD
+    # or NEVER_CANCELED. If the fallback location is archived within 30 days of the charge,
+    # we leave it as NEVER_CANCELED and flag it for manual review.
+    if disputed_loc_resolved:
+        disputed_loc_archived_at = disputed_loc_resolved.get("archived_at")
+    else:
+        # Infer from fallback loc, but only use for CANCELED_AFTER_PERIOD (not REFUND_OWED)
+        fallback_archived = disputed_loc.get("archived_at") if disputed_loc else None
+        if fallback_archived and charge_date_ref:
+            try:
+                from datetime import datetime, timezone
+                arch_str = fmt(fallback_archived)
+                ref = charge_date_ref
+                if str(ref).lstrip("-").isdigit():
+                    ref = datetime.fromtimestamp(int(ref), tz=timezone.utc).strftime("%Y-%m-%d")
+                arch_dt = datetime.strptime(arch_str[:10], "%Y-%m-%d").date()
+                ref_dt  = datetime.strptime(str(ref)[:10], "%Y-%m-%d").date()
+                days_diff = (arch_dt - ref_dt).days
+                # Only use if clearly outside 30-day window — never infer REFUND_OWED
+                disputed_loc_archived_at = fallback_archived if abs(days_diff) > 30 else None
+            except (ValueError, TypeError):
+                disputed_loc_archived_at = None
+        else:
+            disputed_loc_archived_at = None
+
+    # Scope activity to the disputed location only — not the whole company.
+    # Company-wide activity on a 27-location account is misleading for a single-location dispute.
+    disputed_loc_id_for_activity = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
+    if disputed_loc_id_for_activity:
+        act_summary, active_dates, last_active = get_activity_for_location(
+            disputed_loc_id_for_activity, period_start, period_end
+        )
+    # else act_summary/active_dates/last_active already set from company-wide query above
 
     # Use invoice created date as the charge date (more accurate than dispute created_at)
     charge_date_ref = invoice_created or dispute.get("created_at")
