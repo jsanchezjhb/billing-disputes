@@ -135,9 +135,29 @@ def get_dispute(dispute_id):
         pass
     return row
 
-def get_invoice(customer_email, customer_id=None, dispute_amount=None):
-    """Fetch the specific invoice matching this dispute by customer + amount."""
-    # dispute_amount is already formatted as "$126.48" - convert back to cents string
+def get_dispute(dispute_id):
+    rows = run_query(
+        "SELECT dispute_id, amount, status, reason, customer_name, customer_id, "
+        "customer_email, created_at, last_updated_at, evidence_due_date, charge "
+        "FROM " + DISPUTES_TABLE + " WHERE dispute_id = :did",
+        {"did": dispute_id},
+    )
+    if not rows:
+        return None
+    row = dict(rows[0])
+    try:
+        amt = row["amount"]
+        row["amount"] = "$" + "{:.2f}".format(int(amt) / 100)
+    except (TypeError, ValueError):
+        pass
+    return row
+
+def get_invoice(customer_email, customer_id=None, dispute_amount=None, charge_id=None):
+    """Fetch the specific invoice matching this dispute.
+    Tries charge_id first (most precise), then customer+amount as fallback.
+    Using only customer+amount fails when multiple locations are billed the
+    same amount on the same date — charge_id is the only unique identifier.
+    """
     amount_cents = None
     if dispute_amount:
         try:
@@ -145,11 +165,26 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None):
         except (ValueError, AttributeError):
             pass
 
-    # Primary: match by customer_id + amount
+    # Primary: match by charge_id — uniquely identifies the exact transaction
+    if charge_id:
+        rows = run_query(
+            "SELECT id, number, status, amount_paid, amount_due, total, "
+            "currency, period_start, period_end, billing_reason, lines, "
+            "customer_name, customer_email, subscription, charge, "
+            "receipt_number, hosted_invoice_url, created, paid "
+            "FROM " + INVOICE_TABLE + " "
+            "WHERE charge = :chg AND paid = 'true' LIMIT 1",
+            {"chg": charge_id},
+        )
+        if rows:
+            return rows[0]
+
+    # Secondary: match by customer_id + amount (may return wrong invoice if multiple
+    # locations billed same amount same date — only used when charge_id unavailable)
     if customer_id and amount_cents:
         rows = run_query(
             "SELECT id, number, status, amount_paid, amount_due, total, "
-            "currency, period_start, period_end, billing_reason, "
+            "currency, period_start, period_end, billing_reason, lines, "
             "customer_name, customer_email, subscription, charge, "
             "receipt_number, hosted_invoice_url, created, paid "
             "FROM " + INVOICE_TABLE + " "
@@ -165,7 +200,7 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None):
     if amount_cents:
         rows = run_query(
             "SELECT id, number, status, amount_paid, amount_due, total, "
-            "currency, period_start, period_end, billing_reason, "
+            "currency, period_start, period_end, billing_reason, lines, "
             "customer_name, customer_email, subscription, charge, "
             "receipt_number, hosted_invoice_url, created, paid "
             "FROM " + INVOICE_TABLE + " "
@@ -181,7 +216,7 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None):
     if customer_id:
         rows = run_query(
             "SELECT id, number, status, amount_paid, amount_due, total, "
-            "currency, period_start, period_end, billing_reason, "
+            "currency, period_start, period_end, billing_reason, lines, "
             "customer_name, customer_email, subscription, charge, "
             "receipt_number, hosted_invoice_url, created, paid "
             "FROM " + INVOICE_TABLE + " "
@@ -1567,7 +1602,8 @@ def _build_package_inner(dispute_id):
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
     act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
-    invoices       = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"))
+    invoices       = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"),
+                                 charge_id=dispute.get("charge"))
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
 
     # For duplicate disputes, fetch all invoices from the same billing date to prove
