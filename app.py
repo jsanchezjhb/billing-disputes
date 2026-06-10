@@ -738,15 +738,23 @@ def get_strength_badge(signals):
 # ── Reason-specific narrative ─────────────────────────────────────────────────
 def get_reason_content(reason, name, email, company, amount, created,
                        t_act, w_act, m_act, signins, web_si, last_active,
-                       all_locations=None, dispute=None, user=None, verdict=None, loc_archived=None):
+                       all_locations=None, dispute=None, user=None, verdict=None,
+                       loc_archived=None, company_name=None):
     verdict = verdict or ""
     r = (reason or "general").lower()
+    # Helper: "Location X (Company Y account)" when both are available and different
+    def loc_ref(loc_name=None, co_name=None):
+        loc_name = loc_name or company
+        co_name  = co_name or company_name
+        if co_name and co_name != loc_name and co_name not in ("--", ""):
+            return "\"" + loc_name + "\" (" + co_name + " account)"
+        return "\"" + loc_name + "\""
 
     if r == "subscription_canceled":
         if verdict == "REFUND_OWED":
             return [
-                "After reviewing this dispute, our records confirm that the location \""
-                + company + "\" was canceled within 30 days of the disputed charge of "
+                "After reviewing this dispute, our records confirm that the location "
+                + loc_ref() + " was canceled within 30 days of the disputed charge of "
                 + str(amount or "--") + ". Under Homebase's refund policy, customers who cancel within 30 days "
                 "of a charge are entitled to a full refund of that charge.",
                 "The location was canceled on " + (loc_archived or "the date recorded in our system") + ", "
@@ -760,7 +768,7 @@ def get_reason_content(reason, name, email, company, amount, created,
                 "citing \"Subscription Canceled.\" While we confirm the location was subsequently "
                 "canceled, the cancellation occurred outside the 30-day refund window for this charge.",
                 "The disputed charge of " + amount + " was billed on the charge date shown above. "
-                "The location \"" + company + "\" was canceled on " + (loc_archived or "a date after the charge") + ", "
+                "The location " + loc_ref() + " was canceled on " + (loc_archived or "a date after the charge") + ", "
                 "after the 30-day refund window had already closed. "
                 "Under Homebase policy, cancellations must occur within 30 days of a charge to qualify "
                 "for a refund. This cancellation did not meet that requirement.",
@@ -775,7 +783,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
             "citing \"Subscription Canceled.\" Our records demonstrate that no cancellation "
             "was ever processed through the Homebase platform for this location.",
-            "The location (\"" + company + "\") was created on " + created + " and remains fully active "
+            "The location " + loc_ref() + " was created on " + created + " and remains fully active "
             "and unarchived (archived_at = NULL). Cancellation requires "
             "an affirmative in-app action via Settings > Billing & Plan > Cancel Subscription. "
             "No such action was ever taken for this location.",
@@ -794,7 +802,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             + email + ", marked as \"Fraudulent.\" Our records conclusively demonstrate "
             "that this was a legitimate, authorized transaction made by a known and "
             "active Homebase customer.",
-            "The account (\"" + company + "\") was created on " + created + " by the account holder "
+            "The account " + loc_ref() + " was created on " + created + " by the account holder "
             "themselves through the standard Homebase onboarding flow. The account owner "
             "has " + str(signins) + " total sign-ins (" + str(web_si) + " web) across the lifetime of the account, "
             "demonstrating consistent, authorized use of the platform over an extended period.",
@@ -861,7 +869,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
             "citing \"Product Unacceptable.\" Our records show the customer actively used "
             "the Homebase platform throughout the billing period.",
-            "The account (\"" + company + "\") logged " + str(t_act) + " active days during the disputed "
+            "The account " + loc_ref() + " logged " + str(t_act) + " active days during the disputed "
             "period, including " + str(w_act) + " web sessions and " + str(m_act) + " mobile sessions. "
             + ("Most recent activity was recorded on " + last_active + ". " if last_active != "--" else "")
             + "Continued and sustained usage of the platform is inconsistent with a claim "
@@ -881,7 +889,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             "individual charge. The customer did not submit a refund request within 30 days "
             "of this charge, and no cancellation was initiated within that window. No credit "
             "or refund was therefore authorized.",
-            "The account (\"" + company + "\") remains fully active (archived_at = NULL, "
+            "The account " + loc_ref() + " remains fully active (archived_at = NULL, "
             "active_now = TRUE) and was used on " + str(t_act) + " days during the disputed period. "
             "The service was actively rendered and no credit is owed.",
             "The charge of " + amount + " stands as a valid subscription billing.",
@@ -891,7 +899,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
             "citing \"Debit Not Authorized.\" Our records show the customer explicitly "
             "authorized recurring billing when they signed up for a Homebase subscription.",
-            "The account (\"" + company + "\") was created on " + created + " through the standard "
+            "The account " + loc_ref() + " was created on " + created + " through the standard "
             "Homebase onboarding flow, which requires explicit agreement to our Terms of "
             "Service including recurring subscription billing.",
             "The account has " + str(signins) + " total sign-ins (" + str(web_si) + " web) and was active on "
@@ -907,7 +915,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             "citing \"Product Not Received.\" Homebase is a software-as-a-service platform "
             "and our records confirm the customer had full access to and actively used "
             "the service during the disputed billing period.",
-            "The account (\"" + company + "\") was active on " + str(t_act) + " days during the disputed "
+            "The account " + loc_ref() + " was active on " + str(t_act) + " days during the disputed "
             "period, logging " + str(w_act) + " web sessions and " + str(m_act) + " mobile sessions. "
             + ("The most recent recorded activity was " + last_active + ". " if last_active != "--" else "")
             + "This confirms the customer had uninterrupted access to the Homebase platform.",
@@ -922,7 +930,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             "We are disputing the chargeback filed against charge " + amount + " from "
             + email + ", marked as \"Unrecognized.\" Our records show this charge is tied "
             "to an active Homebase account that the cardholder created and has been using continuously.",
-            "The account (\"" + company + "\") was created on " + created + " through the Homebase "
+            "The account " + loc_ref() + " was created on " + created + " through the Homebase "
             "onboarding flow, which requires providing an email address, business details, "
             "and payment information. The account email matches the cardholder email: " + email + ".",
             "The account owner has " + str(signins) + " total sign-ins (" + str(web_si) + " web) and the account "
@@ -937,7 +945,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ", "
             "citing \"Incorrect Account Details.\" Our records confirm the charge was "
             "applied to the correct account associated with this customer.",
-            "The account (\"" + company + "\") is registered under the email " + email + ", which "
+            "The account " + loc_ref() + " is registered under the email " + email + ", which "
             "matches the cardholder contact on file. The account was created on " + created + " "
             "and has been billed correctly according to the subscription plan selected by the customer.",
             "The account has " + str(signins) + " total sign-ins and was active on " + str(t_act) + " days "
@@ -951,7 +959,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             + email + ", noted as \"Bank Cannot Process.\" This is a processing issue "
             "and does not reflect any dispute of the charge validity.",
             "The charge of " + amount + " is a legitimate recurring subscription fee for an "
-            "active Homebase account (\"" + company + "\"). The account was created on " + created + " "
+            "active Homebase account " + loc_ref() + ". The account was created on " + created + " "
             "and has been continuously active with " + str(signins) + " total sign-ins.",
             "We request the bank reprocess this charge. The subscription is valid, the service "
             "has been actively rendered, and the customer has not disputed the validity of the charge.",
@@ -961,7 +969,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             "We are disputing the chargeback against charge " + amount + " from " + email + ". "
             "While we understand the cardholder experienced insufficient funds, the underlying "
             "charge was legitimate and the service was actively rendered.",
-            "The account (\"" + company + "\") was active on " + str(t_act) + " days during the disputed "
+            "The account " + loc_ref() + " was active on " + str(t_act) + " days during the disputed "
             "period with " + str(signins) + " total sign-ins. The subscription was valid and the "
             "service was fully available and used.",
             "The charge of " + amount + " represents a valid subscription fee for services rendered. "
@@ -971,7 +979,7 @@ def get_reason_content(reason, name, email, company, amount, created,
         return [
             "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ". "
             "Our records demonstrate this was a legitimate charge for an active Homebase subscription.",
-            "The account (\"" + company + "\") was created on " + created + " and remains fully active "
+            "The account " + loc_ref() + " was created on " + created + " and remains fully active "
             "(archived_at = NULL, active_now = TRUE). The customer has " + str(signins) + " total "
             "sign-ins and was active on " + str(t_act) + " days during the disputed period.",
             "No cancellation was initiated and the service was actively rendered. "
@@ -993,13 +1001,17 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     s.append(sh("Dispute Statement"))
     name    = dispute.get("customer_name") or ((str(user.get("first_name") or "") + " " + str(user.get("last_name") or "")).strip() if user else "--")
     email   = dispute.get("customer_email","--")
-    company = loc.get("name","--") if loc else "--"
     amount  = dispute.get("amount","--")
-    created = fmt(loc.get("created_at")) if loc else "--"
-    # Use the specific disputed location name/created for narrative context when resolved
+    # Location-specific fields (disputed location)
     loc_name    = loc.get("name","--") if loc else "--"
     loc_created = fmt(loc.get("created_at")) if loc else "--"
     loc_archived = fmt(loc.get("archived_at")) if (loc and loc.get("archived_at")) else None
+    # Company name: use the customer name or derive from all_locations if available
+    # Since Homebase stores location names (not a separate company name field), we use
+    # the account owner name as the company-level identifier alongside the location name
+    company_name = (dispute.get("customer_name") or name or "--")
+    # Legacy 'company' var kept for reason content functions that use it as location label
+    company = loc_name
     t_act   = act_summary.get("total_active_days") or 0
     m_act   = act_summary.get("mobile_active_days") or 0
     w_act   = act_summary.get("web_active_days") or 0
@@ -1011,7 +1023,8 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
         last_active = fmt(best_last_active)
     paras = get_reason_content(dispute.get("reason"), name, email, loc_name, amount, loc_created,
                                t_act, w_act, m_act, signins, web_si, last_active,
-                               all_locations, dispute, user, verdict, loc_archived=loc_archived)
+                               all_locations, dispute, user, verdict, loc_archived=loc_archived,
+                               company_name=company_name)
     for p in paras:
         s.append(bp(p))
         s.append(Spacer(1,6))
@@ -1034,6 +1047,7 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     s.append(kv_table([
         ("Customer",      name),
         ("Email",         email),
+        ("Company",       company_name),
         ("Location",      loc_name + (" (ID: " + str(loc.get("location_id","")) + ")" if loc and loc.get("location_id") else "")),
         ("Location Status", ("Canceled " + loc_archived) if loc_archived else "Active (never canceled)"),
         ("Signup Date",   signup_date),
