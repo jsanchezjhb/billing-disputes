@@ -152,15 +152,11 @@ def get_dispute(dispute_id):
         pass
     return row
 
-def get_invoice(customer_email, customer_id=None, dispute_amount=None, charge_id=None):
-    """Fetch the specific invoice matching this dispute.
-    When multiple invoices exist for the same customer+amount+date (e.g. per-location
-    billing where 4 locations each pay $30 on the same day), fetches all candidates
-    and returns the one that has a resolvable location_id in its lines metadata.
-    Falls back to most recent if none have lines metadata.
+def get_invoice_candidates(customer_email, customer_id=None, dispute_amount=None):
+    """Return ALL paid invoices matching this customer+amount (up to 20).
+    The caller (get_disputed_location_from_candidates) picks the right one
+    by matching location_id in lines against the known account locations.
     """
-    import json as _json
-
     amount_cents = None
     if dispute_amount:
         try:
@@ -168,129 +164,136 @@ def get_invoice(customer_email, customer_id=None, dispute_amount=None, charge_id
         except (ValueError, AttributeError):
             pass
 
-    def pick_best(rows):
-        """From a list of invoice rows, prefer the one with a location_id in lines."""
-        if not rows:
-            return None
-        if len(rows) == 1:
-            return rows[0]
-        for row in rows:
-            lines_raw = row.get("lines")
-            if not lines_raw:
-                continue
-            try:
-                lines = _json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
-                data = lines.get("data", []) if isinstance(lines, dict) else []
-                for item in data:
-                    meta = item.get("metadata", {}) or {}
-                    if meta.get("location_id") and item.get("type") == "subscription" and (item.get("amount") or 0) > 0:
-                        return row
-            except (ValueError, TypeError):
-                continue
-        return rows[0]  # fallback to first if none have resolvable lines
+    SELECT_COLS = (
+        "SELECT id, number, status, amount_paid, amount_due, total, "
+        "currency, period_start, period_end, billing_reason, lines, "
+        "customer_name, customer_email, subscription, charge, "
+        "receipt_number, hosted_invoice_url, created, paid "
+        "FROM " + INVOICE_TABLE + " "
+    )
 
-    # Fetch all recent invoices matching customer + amount (up to 20 — same-day batch)
     if customer_id and amount_cents:
         rows = run_query(
-            "SELECT id, number, status, amount_paid, amount_due, total, "
-            "currency, period_start, period_end, billing_reason, lines, "
-            "customer_name, customer_email, subscription, charge, "
-            "receipt_number, hosted_invoice_url, created, paid "
-            "FROM " + INVOICE_TABLE + " "
+            SELECT_COLS +
             "WHERE customer = :cid AND amount_paid = :amt AND paid = 'true' "
             "ORDER BY created DESC LIMIT 20",
             {"cid": customer_id, "amt": amount_cents},
         )
-        result = pick_best(rows)
-        if result:
-            return result
+        if rows:
+            return rows
 
-    # Fallback: match by email + amount
     if amount_cents:
         rows = run_query(
-            "SELECT id, number, status, amount_paid, amount_due, total, "
-            "currency, period_start, period_end, billing_reason, lines, "
-            "customer_name, customer_email, subscription, charge, "
-            "receipt_number, hosted_invoice_url, created, paid "
-            "FROM " + INVOICE_TABLE + " "
+            SELECT_COLS +
             "WHERE LOWER(customer_email) = LOWER(:email) AND amount_paid = :amt AND paid = 'true' "
             "ORDER BY created DESC LIMIT 20",
             {"email": customer_email, "amt": amount_cents},
         )
-        result = pick_best(rows)
-        if result:
-            return result
+        if rows:
+            return rows
 
-    # Last resort: most recent paid invoice for this customer
+    # Last resort: most recent paid invoice
     if customer_id:
         rows = run_query(
-            "SELECT id, number, status, amount_paid, amount_due, total, "
-            "currency, period_start, period_end, billing_reason, lines, "
-            "customer_name, customer_email, subscription, charge, "
-            "receipt_number, hosted_invoice_url, created, paid "
-            "FROM " + INVOICE_TABLE + " "
-            "WHERE customer = :cid AND paid = 'true' "
-            "ORDER BY created DESC LIMIT 1",
+            SELECT_COLS +
+            "WHERE customer = :cid AND paid = 'true' ORDER BY created DESC LIMIT 1",
             {"cid": customer_id},
         )
         if rows:
-            return rows[0]
+            return rows
 
-    return None
+    return []
+
+
+def get_invoice(customer_email, customer_id=None, dispute_amount=None, charge_id=None):
+    """Return the single best invoice — used for the receipt PDF and charge date.
+    Defers to get_invoice_candidates + first result as fallback when no location
+    matching is possible yet (e.g. before all_locs is available).
+    The real invoice selection happens in get_disputed_location_from_candidates.
+    """
+    candidates = get_invoice_candidates(customer_email, customer_id, dispute_amount)
+    return candidates[0] if candidates else None
 
 def get_disputed_location(invoices_row, all_locs):
-    """
-    Try to identify the specific location being disputed from the invoice lines metadata.
-    Collects every location_id found across all line items, preferring subscription-type
-    lines with amount > 0 (the actual billed location) over tax/invoiceitem lines.
-    Falls back to a direct DB lookup if the location_id is not in all_locs (e.g. capped).
-    Returns the matching location dict or None.
-    """
-    if not invoices_row or not all_locs:
+    """Single-invoice wrapper — kept for compatibility. Delegates to the multi-candidate version."""
+    if not invoices_row:
         return None
-    import json
-    lines_raw = invoices_row.get("lines")
-    if not lines_raw:
-        return None
-    try:
-        lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
-        data = lines.get("data", []) if isinstance(lines, dict) else []
+    result, _ = get_disputed_location_from_candidates([invoices_row], all_locs)
+    return result
 
-        # Collect (location_id, priority) — subscription lines with amount>0 take priority 0
-        candidates = []
-        for item in data:
-            meta = item.get("metadata", {}) or {}
-            loc_id = meta.get("location_id")
-            if loc_id:
+
+def get_disputed_location_from_candidates(invoice_candidates, all_locs):
+    """
+    Given a list of invoice candidates (all same customer+amount), find the one
+    whose lines subscription metadata location_id matches a location in all_locs.
+    Returns (location_dict, invoice_dict) — the matched location and the invoice it came from.
+    Prefers subscription-type line items with amount > 0 over tax/fee lines.
+    Falls back to a direct DB lookup if the location_id is not in all_locs (capped at 100).
+    """
+    import json
+    if not invoice_candidates or not all_locs:
+        return None, (invoice_candidates[0] if invoice_candidates else None)
+
+    all_locs_by_id = {l.get("location_id"): l for l in all_locs}
+
+    for inv in invoice_candidates:
+        lines_raw = inv.get("lines")
+        if not lines_raw:
+            continue
+        try:
+            lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
+            data = lines.get("data", []) if isinstance(lines, dict) else []
+
+            # Score each line item: subscription with amount>0 = priority 0, others = 1
+            candidates = []
+            for item in data:
+                meta = item.get("metadata", {}) or {}
+                loc_id = meta.get("location_id")
+                if not loc_id:
+                    continue
+                try:
+                    loc_id_int = int(loc_id)
+                except (ValueError, TypeError):
+                    continue
                 item_type = item.get("type", "")
                 amount    = item.get("amount", 0) or 0
                 priority  = 0 if (item_type == "subscription" and amount > 0) else 1
-                try:
-                    candidates.append((int(loc_id), priority))
-                except (ValueError, TypeError):
-                    pass
+                candidates.append((loc_id_int, priority))
 
-        candidates.sort(key=lambda x: x[1])
-        all_locs_by_id = {l.get("location_id"): l for l in all_locs}
-        for loc_id_int, _ in candidates:
-            if loc_id_int in all_locs_by_id:
-                return all_locs_by_id[loc_id_int]
+            candidates.sort(key=lambda x: x[1])
 
-        # location_id found in invoice but not in all_locs (account > 100 locations) — fetch directly
-        if candidates:
-            rows = run_query(
-                "SELECT location_id, company_id, name, created_at, archived_at, "
-                "active_now, tier_id, billing_source, mau "
-                "FROM " + LOCATIONS_TABLE + " WHERE location_id = :lid",
-                {"lid": candidates[0][0]},
-            )
-            if rows:
-                return rows[0]
+            for loc_id_int, _ in candidates:
+                if loc_id_int in all_locs_by_id:
+                    return all_locs_by_id[loc_id_int], inv
 
-    except (json.JSONDecodeError, ValueError, TypeError):
-        pass
-    return None
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
 
+    # location_id found in some invoice's lines but not in all_locs — fetch directly
+    # Try all invoices again, take first resolvable location_id and DB-fetch it
+    for inv in invoice_candidates:
+        lines_raw = inv.get("lines")
+        if not lines_raw:
+            continue
+        try:
+            lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
+            data = lines.get("data", []) if isinstance(lines, dict) else []
+            for item in data:
+                meta = item.get("metadata", {}) or {}
+                loc_id = meta.get("location_id")
+                if loc_id and item.get("type") == "subscription" and (item.get("amount") or 0) > 0:
+                    rows = run_query(
+                        "SELECT location_id, company_id, name, created_at, archived_at, "
+                        "active_now, tier_id, billing_source, mau "
+                        "FROM " + LOCATIONS_TABLE + " WHERE location_id = :lid",
+                        {"lid": int(loc_id)},
+                    )
+                    if rows:
+                        return rows[0], inv
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+
+    return None, (invoice_candidates[0] if invoice_candidates else None)
 
 def get_charge_history(customer_id, customer_email, limit=12):
     """Fetch prior successful charges for this customer from stripe.invoice."""
@@ -1625,22 +1628,27 @@ def _build_package_inner(dispute_id):
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
     act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
-    invoices       = get_invoice(customer_email, dispute.get("customer_id"), dispute.get("amount"))
+    invoice_candidates = get_invoice_candidates(customer_email, dispute.get("customer_id"), dispute.get("amount"))
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
 
-    # For duplicate disputes, fetch all invoices from the same billing date to prove
-    # each charge is a separate per-location transaction (Visa rule 5.9.2.2 requires
-    # two transaction receipts showing separate merchandise/services)
+    # Resolve disputed location and correct invoice together from all candidates.
+    # This is the critical step: when multiple invoices have the same amount on the same
+    # date (per-location billing), each invoice's lines metadata has a different location_id.
+    # get_disputed_location_from_candidates scans all candidates and returns the invoice
+    # whose location_id is in all_locs — ensuring both the location and invoice are correct.
+    disputed_loc_resolved, invoices = get_disputed_location_from_candidates(invoice_candidates, all_locs)
+    # invoices is now the matched invoice (or first candidate as fallback)
+    disputed_loc = disputed_loc_resolved or loc  # for PDF display only
+
+    # Use the matched invoice's created date as the charge date reference
     invoice_created = invoices.get("created") if invoices else None
+
+    # For duplicate disputes, fetch all invoices from the same billing date
     same_day_invoices = []
     if (dispute.get("reason") or "").lower() == "duplicate" and invoice_created:
         same_day_invoices = get_same_day_invoices(
             dispute.get("customer_id",""), customer_email, invoice_created
         )
-
-    # Try to identify the specific location this charge applies to from invoice lines metadata.
-    disputed_loc_resolved = get_disputed_location(invoices, all_locs)
-    disputed_loc = disputed_loc_resolved or loc  # for PDF display/narrative only
 
     # Use invoice created date as the charge date (more accurate than dispute created_at)
     charge_date_ref = invoice_created or dispute.get("created_at")
