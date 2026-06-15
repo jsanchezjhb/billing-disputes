@@ -121,7 +121,7 @@ def fmt(val):
 def get_dispute(dispute_id):
     rows = run_query(
         "SELECT dispute_id, amount, status, reason, customer_name, customer_id, "
-        "customer_email, created_at, last_updated_at, evidence_due_date "
+        "customer_email, created_at, last_updated_at, evidence_due_date, charge_id "
         "FROM " + DISPUTES_TABLE + " WHERE dispute_id = :did",
         {"did": dispute_id},
     )
@@ -135,27 +135,10 @@ def get_dispute(dispute_id):
         pass
     return row
 
-def get_dispute(dispute_id):
-    rows = run_query(
-        "SELECT dispute_id, amount, status, reason, customer_name, customer_id, "
-        "customer_email, created_at, last_updated_at, evidence_due_date "
-        "FROM " + DISPUTES_TABLE + " WHERE dispute_id = :did",
-        {"did": dispute_id},
-    )
-    if not rows:
-        return None
-    row = dict(rows[0])
-    try:
-        amt = row["amount"]
-        row["amount"] = "$" + "{:.2f}".format(int(amt) / 100)
-    except (TypeError, ValueError):
-        pass
-    return row
-
-def get_invoice_candidates(customer_email, customer_id=None, dispute_amount=None):
-    """Return ALL paid invoices matching this customer+amount (up to 20).
-    The caller (get_disputed_location_from_candidates) picks the right one
-    by matching location_id in lines against the known account locations.
+def get_invoice_candidates(customer_email, customer_id=None, dispute_amount=None, dispute_created_at=None, charge_id=None):
+    """Return the matching invoice(s) for this dispute.
+    Primary: match by charge_id — guaranteed 1:1 with the disputed transaction.
+    Fallback: customer+amount filtered to pre-dispute invoices, ordered by period_end DESC.
     """
     amount_cents = None
     if dispute_amount:
@@ -172,11 +155,36 @@ def get_invoice_candidates(customer_email, customer_id=None, dispute_amount=None
         "FROM " + INVOICE_TABLE + " "
     )
 
+    # Primary: charge_id uniquely identifies the exact invoice — no ambiguity
+    if charge_id:
+        rows = run_query(
+            SELECT_COLS + "WHERE charge = :chg AND paid = 'true' LIMIT 1",
+            {"chg": charge_id},
+        )
+        if rows:
+            return rows
+
+    # Fallback: customer+amount filtered to pre-dispute invoices
+    dispute_ts = None
+    if dispute_created_at:
+        try:
+            from datetime import datetime, timezone
+            if str(dispute_created_at).lstrip("-").isdigit():
+                dispute_ts = int(dispute_created_at)
+            else:
+                dt = datetime.strptime(str(dispute_created_at)[:19], "%Y-%m-%dT%H:%M:%S")
+                dispute_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
+        except (ValueError, TypeError):
+            pass
+
+    date_filter = (" AND created < '" + str(dispute_ts) + "'" if dispute_ts else "")
+
     if customer_id and amount_cents:
         rows = run_query(
             SELECT_COLS +
-            "WHERE customer = :cid AND amount_paid = :amt AND paid = 'true' "
-            "ORDER BY created DESC LIMIT 20",
+            "WHERE customer = :cid AND amount_paid = :amt AND paid = 'true'" +
+            date_filter +
+            " ORDER BY period_end DESC LIMIT 20",
             {"cid": customer_id, "amt": amount_cents},
         )
         if rows:
@@ -185,25 +193,27 @@ def get_invoice_candidates(customer_email, customer_id=None, dispute_amount=None
     if amount_cents:
         rows = run_query(
             SELECT_COLS +
-            "WHERE LOWER(customer_email) = LOWER(:email) AND amount_paid = :amt AND paid = 'true' "
-            "ORDER BY created DESC LIMIT 20",
+            "WHERE LOWER(customer_email) = LOWER(:email) AND amount_paid = :amt AND paid = 'true'" +
+            date_filter +
+            " ORDER BY period_end DESC LIMIT 20",
             {"email": customer_email, "amt": amount_cents},
         )
         if rows:
             return rows
 
-    # Last resort: most recent paid invoice
+    # Last resort: most recent paid invoice before dispute
     if customer_id:
         rows = run_query(
             SELECT_COLS +
-            "WHERE customer = :cid AND paid = 'true' ORDER BY created DESC LIMIT 1",
+            "WHERE customer = :cid AND paid = 'true'" +
+            date_filter +
+            " ORDER BY period_end DESC LIMIT 1",
             {"cid": customer_id},
         )
         if rows:
             return rows
 
     return []
-
 
 def get_invoice(customer_email, customer_id=None, dispute_amount=None, charge_id=None):
     """Return the single best invoice — used for the receipt PDF and charge date.
@@ -224,18 +234,26 @@ def get_disputed_location(invoices_row, all_locs):
 
 def get_disputed_location_from_candidates(invoice_candidates, all_locs):
     """
-    Given a list of invoice candidates (all same customer+amount), find the one
+    Given a list of invoice candidates (same customer+amount, pre-dispute), find the one
     whose lines subscription metadata location_id matches a location in all_locs.
-    Returns (location_dict, invoice_dict) — the matched location and the invoice it came from.
-    Prefers subscription-type line items with amount > 0 over tax/fee lines.
-    Falls back to a direct DB lookup if the location_id is not in all_locs (capped at 100).
+
+    Scoring per candidate invoice:
+      - Subscription-type line with amount > 0 and a matching location_id: score 0 (best)
+      - Other line types: score 1
+    Among equal-score matches, prefer latest period_end (most recent billing period).
+
+    Returns (location_dict, invoice_dict).
     """
     import json
-    if not invoice_candidates or not all_locs:
-        return None, (invoice_candidates[0] if invoice_candidates else None)
+    if not invoice_candidates:
+        return None, None
+    if not all_locs:
+        return None, invoice_candidates[0]
 
     all_locs_by_id = {l.get("location_id"): l for l in all_locs}
 
+    # Build scored list of (priority, period_end, location, invoice)
+    scored = []
     for inv in invoice_candidates:
         lines_raw = inv.get("lines")
         if not lines_raw:
@@ -243,9 +261,6 @@ def get_disputed_location_from_candidates(invoice_candidates, all_locs):
         try:
             lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
             data = lines.get("data", []) if isinstance(lines, dict) else []
-
-            # Score each line item: subscription with amount>0 = priority 0, others = 1
-            candidates = []
             for item in data:
                 meta = item.get("metadata", {}) or {}
                 loc_id = meta.get("location_id")
@@ -255,22 +270,25 @@ def get_disputed_location_from_candidates(invoice_candidates, all_locs):
                     loc_id_int = int(loc_id)
                 except (ValueError, TypeError):
                     continue
+                if loc_id_int not in all_locs_by_id:
+                    continue
                 item_type = item.get("type", "")
                 amount    = item.get("amount", 0) or 0
                 priority  = 0 if (item_type == "subscription" and amount > 0) else 1
-                candidates.append((loc_id_int, priority))
-
-            candidates.sort(key=lambda x: x[1])
-
-            for loc_id_int, _ in candidates:
-                if loc_id_int in all_locs_by_id:
-                    return all_locs_by_id[loc_id_int], inv
-
+                # Use period_end as tiebreaker — most recent billing period wins
+                try:
+                    period_end = int(inv.get("period_end") or 0)
+                except (ValueError, TypeError):
+                    period_end = 0
+                scored.append((priority, -period_end, all_locs_by_id[loc_id_int], inv))
         except (json.JSONDecodeError, ValueError, TypeError):
             continue
 
-    # location_id found in some invoice's lines but not in all_locs — fetch directly
-    # Try all invoices again, take first resolvable location_id and DB-fetch it
+    if scored:
+        scored.sort(key=lambda x: (x[0], x[1]))
+        return scored[0][2], scored[0][3]
+
+    # location_id found but not in all_locs (account > 100 locations) — DB fetch
     for inv in invoice_candidates:
         lines_raw = inv.get("lines")
         if not lines_raw:
@@ -293,7 +311,7 @@ def get_disputed_location_from_candidates(invoice_candidates, all_locs):
         except (json.JSONDecodeError, ValueError, TypeError):
             continue
 
-    return None, (invoice_candidates[0] if invoice_candidates else None)
+    return None, invoice_candidates[0]
 
 def get_charge_history(customer_id, customer_email, limit=12):
     """Fetch prior successful charges for this customer from stripe.invoice."""
@@ -1628,7 +1646,9 @@ def _build_package_inner(dispute_id):
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
     act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
-    invoice_candidates = get_invoice_candidates(customer_email, dispute.get("customer_id"), dispute.get("amount"))
+    invoice_candidates = get_invoice_candidates(customer_email, dispute.get("customer_id"),
+                                                dispute.get("amount"), dispute.get("created_at"),
+                                                charge_id=dispute.get("charge_id"))
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
 
     # Resolve disputed location and correct invoice together from all candidates.
