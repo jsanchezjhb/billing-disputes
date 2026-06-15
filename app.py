@@ -31,6 +31,7 @@ UPGRADES_TABLE  = "prod_redshift_replica.public.upgrades_downgrades"
 ACTIVITY_TABLE  = "prod_redshift_replica.public.fact_locations_by_day"
 INVOICE_TABLE   = "prod_redshift_replica.stripe.invoice"
 PAYROLL_TABLE   = "prod_redshift_replica.public.payroll_setup_infos"
+COMPANIES_TABLE = "prod_redshift_replica.public.companies"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 DARK       = colors.HexColor("#0f172a")
@@ -436,6 +437,16 @@ def get_plan_history(company_id):
         "FROM " + UPGRADES_TABLE + " WHERE company_id = :cid ORDER BY created_at DESC",
         {"cid": company_id},
     )
+
+def get_company_name(company_id):
+    """Fetch the business name from the companies table."""
+    rows = run_query(
+        "SELECT name FROM " + COMPANIES_TABLE + " WHERE id = :cid LIMIT 1",
+        {"cid": company_id},
+    )
+    if rows and rows[0].get("name"):
+        return str(rows[0]["name"])
+    return None
 
 def get_activity_for_location(location_id, period_start, period_end):
     """Activity query scoped to a single location — avoids inflating stats across multi-location accounts."""
@@ -1008,7 +1019,7 @@ def get_reason_content(reason, name, email, company, amount, created,
         ]
 
 # ── PDF generators ────────────────────────────────────────────────────────────
-def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_active, all_locations=None, charge_history=None, signals=None):
+def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_active, all_locations=None, charge_history=None, signals=None, company_name=None):
     buf = io.BytesIO()
     doc = make_doc(buf, "Dispute Narrative")
     s = []
@@ -1027,10 +1038,8 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     loc_name    = loc.get("name","--") if loc else "--"
     loc_created = fmt(loc.get("created_at")) if loc else "--"
     loc_archived = fmt(loc.get("archived_at")) if (loc and loc.get("archived_at")) else None
-    # Company name: use the customer name or derive from all_locations if available
-    # Since Homebase stores location names (not a separate company name field), we use
-    # the account owner name as the company-level identifier alongside the location name
-    company_name = (dispute.get("customer_name") or name or "--")
+    # Company name: use fetched company name, fall back to customer name if unavailable
+    company_name = company_name or dispute.get("customer_name") or name or "--"
     # Legacy 'company' var kept for reason content functions that use it as location label
     company = loc_name
     t_act   = act_summary.get("total_active_days") or 0
@@ -1632,6 +1641,7 @@ def _build_package_inner(dispute_id):
         raise ValueError("No Homebase account found for: " + customer_email)
     company_id    = loc["company_id"]
     plan_history  = get_plan_history(company_id)
+    company_name  = get_company_name(company_id)
     all_locations = all_locs  # already fetched in get_account
     created = str(dispute.get("created_at") or "")[:10]
     # Use account creation date as period start to capture all activity
@@ -1722,7 +1732,7 @@ def _build_package_inner(dispute_id):
     charge_is_payroll = is_payroll_invoice(invoices)
     slug = dispute_id.replace("_","-")
     pkg = {
-        slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals),
+        slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals, company_name=company_name),
         slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices, same_day_invoices,
                                                                 active_loc_count=len([l for l in all_locs if not l.get("archived_at")])),
         slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history, all_locations, disputed_loc=disputed_loc_resolved),
@@ -1754,6 +1764,7 @@ def _build_package_inner(dispute_id):
             })
     pkg["_needs_downgrade"] = needs_downgrade
     pkg["_company_id"]            = loc.get("company_id") if loc else None
+    pkg["_company_name"]          = company_name
     pkg["_disputed_location_id"]  = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
     pkg["_disputed_location_name"] = (disputed_loc_resolved or disputed_loc or {}).get("name","")
     pkg["_disputed_loc_resolved"] = disputed_loc_resolved is not None
