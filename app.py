@@ -441,7 +441,7 @@ def get_plan_history(company_id):
 def get_company_name(company_id):
     """Fetch the business name from the companies table."""
     rows = run_query(
-        "SELECT name FROM " + COMPANIES_TABLE + " WHERE id = :cid LIMIT 1",
+        "SELECT name FROM " + COMPANIES_TABLE + " WHERE company_id = :cid LIMIT 1",
         {"cid": company_id},
     )
     if rows and rows[0].get("name"):
