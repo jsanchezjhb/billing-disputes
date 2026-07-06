@@ -1828,7 +1828,12 @@ app.layout = html.Div([
         dcc.Download(id="dl-all"),
         dcc.Store(id="pdf-store", storage_type="memory"),
         # Buttons must exist in layout at startup for Dash to register their callbacks
-        # Download buttons rendered dynamically in callback output
+        # Hidden placeholders — required for Dash to register download callbacks at startup
+        html.Button(id="dl-btn-1",   n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-2",   n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-3",   n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-4",   n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-all", n_clicks=0, style={"display":"none"}),
 
 
 
@@ -1879,7 +1884,7 @@ def on_generate(n_clicks, dispute_id):
         dl_buttons = html.Div([
             html.Button(
                 "⬇  Download All (ZIP)",
-                id="dl-btn-all", n_clicks=0,
+                id="dl-btn-all-v", n_clicks=0,
                 style={"display":"block","width":"100%","textAlign":"center",
                        "padding":"12px 14px","marginBottom":"12px",
                        "background":"#0f172a","color":"#f1f5f9",
@@ -1889,7 +1894,7 @@ def on_generate(n_clicks, dispute_id):
             html.Div("Or download individually:", style={"fontSize":"12px","color":"#6b7280","marginBottom":"8px"}),
             html.Div([
                 html.Button(str(i+1) + ". " + STRIPE_UPLOAD_CATEGORIES[i][0],
-                           id="dl-btn-" + str(i+1), n_clicks=0,
+                           id="dl-btn-" + str(i+1) + "-v", n_clicks=0,
                            style={"display":"block","width":"100%","textAlign":"left",
                                   "padding":"10px 14px","marginBottom":"6px",
                                   "background":"#f8fafc","border":"1px solid #e2e8f0",
@@ -2058,27 +2063,27 @@ def on_generate(n_clicks, dispute_id):
         )
 
 
-@app.callback(Output("dl-1","data"), Input("dl-btn-1","n_clicks"),
+@app.callback(Output("dl-1","data"), Input("dl-btn-1-v","n_clicks"),
               State("pdf-store","data"), prevent_initial_call=True, allow_duplicate=True)
 def dl1(n, store):
     return _download(n, store, 0)
 
-@app.callback(Output("dl-2","data"), Input("dl-btn-2","n_clicks"),
+@app.callback(Output("dl-2","data"), Input("dl-btn-2-v","n_clicks"),
               State("pdf-store","data"), prevent_initial_call=True, allow_duplicate=True)
 def dl2(n, store):
     return _download(n, store, 1)
 
-@app.callback(Output("dl-3","data"), Input("dl-btn-3","n_clicks"),
+@app.callback(Output("dl-3","data"), Input("dl-btn-3-v","n_clicks"),
               State("pdf-store","data"), prevent_initial_call=True, allow_duplicate=True)
 def dl3(n, store):
     return _download(n, store, 2)
 
-@app.callback(Output("dl-4","data"), Input("dl-btn-4","n_clicks"),
+@app.callback(Output("dl-4","data"), Input("dl-btn-4-v","n_clicks"),
               State("pdf-store","data"), prevent_initial_call=True, allow_duplicate=True)
 def dl4(n, store):
     return _download(n, store, 3)
 
-@app.callback(Output("dl-all","data"), Input("dl-btn-all","n_clicks"),
+@app.callback(Output("dl-all","data"), Input("dl-btn-all-v","n_clicks"),
               State("pdf-store","data"), prevent_initial_call=True, allow_duplicate=True)
 def dl_all(n, store):
     if not store or not n:
