@@ -1829,11 +1829,31 @@ app.layout = html.Div([
         dcc.Store(id="pdf-store", storage_type="memory"),
         # Buttons must exist in layout at startup for Dash to register their callbacks
         # Hidden placeholders — required for Dash to register download callbacks at startup
-        html.Button(id="dl-btn-1",   n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-2",   n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-3",   n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-4",   n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-all", n_clicks=0, style={"display":"none"}),
+        # Download buttons — always in layout, shown after package is generated
+        html.Div(id="dl-btn-container", style={"display":"none"}, children=[
+            html.Button("⬇  Download All (ZIP)", id="dl-btn-all-v", n_clicks=0,
+                style={"display":"block","width":"100%","textAlign":"center",
+                       "padding":"12px 14px","marginBottom":"12px",
+                       "background":"#0f172a","color":"#f1f5f9","border":"none",
+                       "borderRadius":"8px","fontSize":"14px","fontWeight":"700","cursor":"pointer"}),
+            html.Div("Or download individually:", style={"fontSize":"12px","color":"#6b7280","marginBottom":"8px"}),
+            html.Button("1. Dispute Narrative & Activity Logs", id="dl-btn-1-v", n_clicks=0,
+                style={"display":"block","width":"100%","textAlign":"left","padding":"10px 14px",
+                       "marginBottom":"6px","background":"#f8fafc","border":"1px solid #e2e8f0",
+                       "borderRadius":"8px","fontSize":"13px","cursor":"pointer"}),
+            html.Button("2. Dispute Details and Receipt",       id="dl-btn-2-v", n_clicks=0,
+                style={"display":"block","width":"100%","textAlign":"left","padding":"10px 14px",
+                       "marginBottom":"6px","background":"#f8fafc","border":"1px solid #e2e8f0",
+                       "borderRadius":"8px","fontSize":"13px","cursor":"pointer"}),
+            html.Button("3. Service Documentation",             id="dl-btn-3-v", n_clicks=0,
+                style={"display":"block","width":"100%","textAlign":"left","padding":"10px 14px",
+                       "marginBottom":"6px","background":"#f8fafc","border":"1px solid #e2e8f0",
+                       "borderRadius":"8px","fontSize":"13px","cursor":"pointer"}),
+            html.Button("4. Refund and Cancellation Policy",    id="dl-btn-4-v", n_clicks=0,
+                style={"display":"block","width":"100%","textAlign":"left","padding":"10px 14px",
+                       "marginBottom":"6px","background":"#f8fafc","border":"1px solid #e2e8f0",
+                       "borderRadius":"8px","fontSize":"13px","cursor":"pointer"}),
+        ]),
 
 
 
@@ -1848,6 +1868,7 @@ app.layout = html.Div([
     Output("status-output","children"),
     Output("download-section","children"),
     Output("pdf-store","data"),
+    Output("dl-btn-container","style"),
     Input("generate-btn","n_clicks"),
     State("dispute-input","value"),
     prevent_initial_call=True,
@@ -1856,7 +1877,7 @@ def on_generate(n_clicks, dispute_id):
     if not dispute_id or not dispute_id.strip():
         return (html.Div("Please enter a dispute ID.",
                         style={"color":"#dc2626","fontSize":"13px"}),
-                [], None)
+                [], None, {"display":"none"})
     # Clear previous results immediately so old content doesnt persist
     try:
         pdfs      = build_package(dispute_id.strip())
@@ -1879,29 +1900,6 @@ def on_generate(n_clicks, dispute_id):
                 html.Div(fn, style={"fontSize":"11px","color":"#9ca3af","fontFamily":"monospace","marginBottom":"6px"}),
             ], style={"background":"#fff","border":"1px solid #e5e7eb","borderRadius":"10px",
                       "padding":"12px 16px","marginBottom":"8px"}))
-
-        # Download All button + individual buttons
-        dl_buttons = html.Div([
-            html.Button(
-                "⬇  Download All (ZIP)",
-                id="dl-btn-all-v", n_clicks=0,
-                style={"display":"block","width":"100%","textAlign":"center",
-                       "padding":"12px 14px","marginBottom":"12px",
-                       "background":"#0f172a","color":"#f1f5f9",
-                       "border":"none","borderRadius":"8px",
-                       "fontSize":"14px","fontWeight":"700","cursor":"pointer"}
-            ),
-            html.Div("Or download individually:", style={"fontSize":"12px","color":"#6b7280","marginBottom":"8px"}),
-            html.Div([
-                html.Button(str(i+1) + ". " + STRIPE_UPLOAD_CATEGORIES[i][0],
-                           id="dl-btn-" + str(i+1) + "-v", n_clicks=0,
-                           style={"display":"block","width":"100%","textAlign":"left",
-                                  "padding":"10px 14px","marginBottom":"6px",
-                                  "background":"#f8fafc","border":"1px solid #e2e8f0",
-                                  "borderRadius":"8px","fontSize":"13px","cursor":"pointer"})
-                for i in range(4)
-            ]),
-        ])
 
         # Build signals UI from the signals dict stored in pdf package
         sig        = pdfs.get("_signals", {})
@@ -2051,7 +2049,7 @@ def on_generate(n_clicks, dispute_id):
                            "borderRadius": "8px", "padding": "12px 14px", "marginTop": "8px"}),
             ])
 
-        return status, rows + [dl_buttons], store
+        return status, rows, store, {"display":"block","marginTop":"20px"}
 
     except Exception as e:
         return (
@@ -2059,7 +2057,7 @@ def on_generate(n_clicks, dispute_id):
                      style={"background":"#fef2f2","border":"1px solid #fecaca",
                             "borderRadius":"8px","padding":"10px 14px",
                             "color":"#991b1b","fontSize":"13px"}),
-            [], None,
+            [], None, {"display":"none"},
         )
 
 
