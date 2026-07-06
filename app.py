@@ -1832,7 +1832,7 @@ app.layout = html.Div([
         html.Button(id="dl-btn-2",   n_clicks=0, style={"display":"none"}),
         html.Button(id="dl-btn-3",   n_clicks=0, style={"display":"none"}),
         html.Button(id="dl-btn-4",   n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-all", n_clicks=0, style={"display":"none"}),
+        html.Button(id="dl-btn-all-placeholder", n_clicks=0, style={"display":"none"}),
 
 
 
