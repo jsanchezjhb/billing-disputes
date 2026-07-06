@@ -1828,11 +1828,7 @@ app.layout = html.Div([
         dcc.Download(id="dl-all"),
         dcc.Store(id="pdf-store", storage_type="memory"),
         # Buttons must exist in layout at startup for Dash to register their callbacks
-        html.Button(id="dl-btn-1",   n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-2",   n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-3",   n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-4",   n_clicks=0, style={"display":"none"}),
-        html.Button(id="dl-btn-all-placeholder", n_clicks=0, style={"display":"none"}),
+        # Download buttons rendered dynamically in callback output
 
 
 
@@ -2063,27 +2059,27 @@ def on_generate(n_clicks, dispute_id):
 
 
 @app.callback(Output("dl-1","data"), Input("dl-btn-1","n_clicks"),
-              State("pdf-store","data"), prevent_initial_call=True)
+              State("pdf-store","data"), prevent_initial_call=True, allow_duplicate=True)
 def dl1(n, store):
     return _download(n, store, 0)
 
 @app.callback(Output("dl-2","data"), Input("dl-btn-2","n_clicks"),
-              State("pdf-store","data"), prevent_initial_call=True)
+              State("pdf-store","data"), prevent_initial_call=True, allow_duplicate=True)
 def dl2(n, store):
     return _download(n, store, 1)
 
 @app.callback(Output("dl-3","data"), Input("dl-btn-3","n_clicks"),
-              State("pdf-store","data"), prevent_initial_call=True)
+              State("pdf-store","data"), prevent_initial_call=True, allow_duplicate=True)
 def dl3(n, store):
     return _download(n, store, 2)
 
 @app.callback(Output("dl-4","data"), Input("dl-btn-4","n_clicks"),
-              State("pdf-store","data"), prevent_initial_call=True)
+              State("pdf-store","data"), prevent_initial_call=True, allow_duplicate=True)
 def dl4(n, store):
     return _download(n, store, 3)
 
 @app.callback(Output("dl-all","data"), Input("dl-btn-all","n_clicks"),
-              State("pdf-store","data"), prevent_initial_call=True)
+              State("pdf-store","data"), prevent_initial_call=True, allow_duplicate=True)
 def dl_all(n, store):
     if not store or not n:
         return dash.no_update
