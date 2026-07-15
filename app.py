@@ -455,13 +455,29 @@ def get_plan_history(company_id):
     )
 
 def get_company_name(company_id):
-    """Fetch the business name from the companies table."""
-    rows = run_query(
-        "SELECT name FROM " + COMPANIES_TABLE + " WHERE company_id = :cid LIMIT 1",
-        {"cid": company_id},
-    )
-    if rows and rows[0].get("name"):
-        return str(rows[0]["name"])
+    """Fetch business name from companies table using a separate short-timeout connection.
+    Returns None gracefully if slow or unavailable — never blocks the evidence package."""
+    try:
+        from databricks.sdk.core import Config
+        cfg = Config()
+        conn = databricks_sql.connect(
+            server_hostname=cfg.host,
+            http_path=DATABRICKS_HTTP_PATH,
+            credentials_provider=lambda: cfg.authenticate,
+            _socket_timeout=8,
+            connection_timeout=8,
+        )
+        try:
+            sql = "SELECT name FROM " + COMPANIES_TABLE + " WHERE company_id = " + esc(company_id) + " LIMIT 1"
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                rows = cur.fetchall()
+                if rows and rows[0][0]:
+                    return str(rows[0][0])
+        finally:
+            conn.close()
+    except Exception:
+        pass
     return None
 
 def get_activity_for_location(location_id, period_start, period_end):
