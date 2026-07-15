@@ -1,7 +1,5 @@
 import io
 import os
-from contextvars import ContextVar
-_conn_var = ContextVar("db_conn", default=None)
 import dash
 from dash import dcc, html, Input, Output, State, callback_context
 from databricks import sql as databricks_sql
@@ -123,16 +121,11 @@ def run_query(sql_str, params=None, conn=None):
                 cols = [d[0] for d in cur.description]
                 return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-        # Use explicitly passed conn, then context-var conn, then open a new one
-        effective_conn = conn or _conn_var.get()
-        if effective_conn is not None:
-            return _execute(effective_conn)
+        if conn is not None:
+            return _execute(conn)
         else:
-            c = get_conn()
-            try:
+            with get_conn() as c:
                 return _execute(c)
-            finally:
-                c.close()
     except Exception as e:
         raise RuntimeError(f"Query failed: {str(e)} | SQL: {sql_str[:300]}") from e
 
@@ -2025,28 +2018,30 @@ def pdf_policy(dispute, loc):
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 def build_package(dispute_id):
     from datetime import date, timedelta, datetime
-    # Open one connection per build and set it in a ContextVar so all run_query
-    # calls in this async context reuse it — thread-safe, no global monkey-patch.
+    # Open a single connection for the entire build — avoids 8-10 separate
+    # OAuth handshakes and warehouse cold-starts that cause spinner-forever hangs.
+    # Do NOT use `with get_conn()` — the Databricks connection context manager
+    # closes the connection on __exit__ immediately, before any queries run.
     _conn = get_conn()
-    token = _conn_var.set(_conn)
+    _orig_run_query = globals()["run_query"]
+    def _run_query_with_conn(sql_str, params=None, conn=None):
+        return _orig_run_query(sql_str, params=params, conn=_conn)
+    globals()["run_query"] = _run_query_with_conn
     try:
-        return _build_package_inner(dispute_id, _conn)
+        return _build_package_inner(dispute_id)
     finally:
-        _conn_var.reset(token)
+        globals()["run_query"] = _orig_run_query
         try:
             _conn.close()
         except Exception:
             pass
 
-def _build_package_inner(dispute_id, _conn=None):
-    import logging
+def _build_package_inner(dispute_id):
+    import time
     from datetime import date, timedelta, datetime
-    logger = logging.getLogger("disputes")
     def _log(msg):
-        logger.warning("[BUILD %s] %s", dispute_id[:12], msg)
         print(f"[BUILD {dispute_id[:12]}] {msg}", flush=True)
-    def rq(sql, params=None):
-        return run_query(sql, params=params, conn=_conn)
+
     _log("start")
     dispute = get_dispute(dispute_id)
     _log("got dispute")
@@ -2078,36 +2073,49 @@ def _build_package_inner(dispute_id, _conn=None):
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
     act_summary, active_dates, last_active = {}, [], "--"
+    _log("skipped company-wide activity (will query by location after resolution)")
     _log("fetching invoices")
     invoice_candidates = get_invoice_candidates(customer_email, dispute.get("customer_id"),
                                                 dispute.get("amount"), dispute.get("created_at"),
                                                 charge_id=dispute.get("charge_id"))
     _log("got invoice candidates: " + str(len(invoice_candidates)))
+    _log("fetching charge history")
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
+    _log("got charge history")
 
     # Resolve disputed location and correct invoice together from all candidates.
     # This is the critical step: when multiple invoices have the same amount on the same
     # date (per-location billing), each invoice's lines metadata has a different location_id.
     # get_disputed_location_from_candidates scans all candidates and returns the invoice
     # whose location_id is in all_locs — ensuring both the location and invoice are correct.
-    _log("got charge history")
     disputed_loc_resolved, invoices = get_disputed_location_from_candidates(invoice_candidates, all_locs)
-    _log("resolved loc: " + str((disputed_loc_resolved or {}).get("location_id","none")))
-    disputed_loc = disputed_loc_resolved or loc
+    _log("resolved disputed loc")
+    # invoices is now the matched invoice (or first candidate as fallback)
+    disputed_loc = disputed_loc_resolved or loc  # for PDF display only
 
+    # Use the matched invoice's created date as the charge date reference
     invoice_created = invoices.get("created") if invoices else None
 
+    # For duplicate disputes, fetch all invoices from the same billing date
     same_day_invoices = []
     if (dispute.get("reason") or "").lower() == "duplicate" and invoice_created:
         same_day_invoices = get_same_day_invoices(
             dispute.get("customer_id",""), customer_email, invoice_created
         )
 
+    # Use invoice created date as the charge date (more accurate than dispute created_at)
     charge_date_ref = invoice_created or dispute.get("created_at")
-    charge_date_ref = invoice_created or dispute.get("created_at")
+
+    # For verdict: use resolved location if available. If not resolved from invoice metadata,
+    # fall back to the inferred location (disputed_loc) ONLY when the archived_at is clearly
+    # outside the refund window — i.e. canceled more than 30 days before the charge OR more
+    # than 30 days after. We never infer REFUND_OWED (too high stakes) — only CANCELED_AFTER_PERIOD
+    # or NEVER_CANCELED. If the fallback location is archived within 30 days of the charge,
+    # we leave it as NEVER_CANCELED and flag it for manual review.
     if disputed_loc_resolved:
         disputed_loc_archived_at = disputed_loc_resolved.get("archived_at")
     else:
+        # Infer from fallback loc, but only use for CANCELED_AFTER_PERIOD (not REFUND_OWED)
         fallback_archived = disputed_loc.get("archived_at") if disputed_loc else None
         if fallback_archived and charge_date_ref:
             try:
@@ -2119,29 +2127,35 @@ def _build_package_inner(dispute_id, _conn=None):
                 arch_dt = datetime.strptime(arch_str[:10], "%Y-%m-%d").date()
                 ref_dt  = datetime.strptime(str(ref)[:10], "%Y-%m-%d").date()
                 days_diff = (arch_dt - ref_dt).days
+                # Only use if clearly outside 30-day window — never infer REFUND_OWED
                 disputed_loc_archived_at = fallback_archived if abs(days_diff) > 30 else None
             except (ValueError, TypeError):
                 disputed_loc_archived_at = None
         else:
             disputed_loc_archived_at = None
 
+    # Scope activity to the disputed location only — not the whole company.
+    # Company-wide activity on a 27-location account is misleading for a single-location dispute.
     disputed_loc_id_for_activity = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
-    _log("fetching location activity")
     if disputed_loc_id_for_activity:
+        _log("fetching location activity for " + str(disputed_loc_id_for_activity))
         act_summary, active_dates, last_active = get_activity_for_location(
             disputed_loc_id_for_activity, period_start, period_end
         )
-    # else: activity remains empty defaults set above
-    _log("got activity")
+        _log("got location activity")
+    else:
+        _log("no location ID — activity remains empty")
 
-    _log("determining verdict")
-    downgrade_within_window = False
+    # Verdict is based solely on whether the account was actually canceled (archived_at).
+    # A downgrade to Tier 1 does NOT trigger a refund — the customer continued using the
+    # service at the paid tier through the billing period before choosing to downgrade.
+    # Only a true cancellation (archived_at set) within 30 days of the charge date triggers REFUND_OWED.
+    downgrade_within_window = False  # retained for UI/pkg metadata compatibility
     downgrade_date = None
     verdict = determine_verdict(dispute.get("reason"), disputed_loc_archived_at,
                                 dispute.get("evidence_due_date"), charge_date_ref)
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
     charge_is_payroll = is_payroll_invoice(invoices)
-    _log("verdict: " + str(verdict))
     slug = dispute_id.replace("_","-")
     _log("building PDF 1")
     pdf1 = pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals, company_name=company_name)
@@ -2165,11 +2179,15 @@ def _build_package_inner(dispute_id, _conn=None):
     pkg["_downgrade_within_window"] = downgrade_within_window
     pkg["_archived_at"]           = downgrade_date if downgrade_within_window else ((fmt(disputed_loc.get("archived_at")) if disputed_loc else None) or "--")
 
+    # Check if the disputed location needs action:
+    # Flag if it is NOT canceled OR still above Tier 1
     needs_downgrade = []
     dl = disputed_loc or loc
     if dl:
         not_canceled = not dl.get("archived_at")
         above_tier1  = str(dl.get("tier_id","1")) != "1"
+        # Only flag if BOTH not canceled AND above tier 1
+        # Tier 1 is free so no downgrade needed even if not canceled
         if not_canceled and above_tier1:
             needs_downgrade.append({
                 "location_id": dl.get("location_id"),
@@ -2185,7 +2203,6 @@ def _build_package_inner(dispute_id, _conn=None):
     pkg["_disputed_location_id"]  = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
     pkg["_disputed_location_name"] = (disputed_loc_resolved or disputed_loc or {}).get("name","")
     pkg["_disputed_loc_resolved"] = disputed_loc_resolved is not None
-    _log("done")
     return pkg
 
 # ── Dash app ──────────────────────────────────────────────────────────────────
