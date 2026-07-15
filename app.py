@@ -2037,28 +2037,19 @@ def build_package(dispute_id):
             pass
 
 def _build_package_inner(dispute_id):
-    import time
     from datetime import date, timedelta, datetime
-    def _log(msg):
-        print(f"[BUILD {dispute_id[:12]}] {msg}", flush=True)
-
-    _log("start")
     dispute = get_dispute(dispute_id)
-    _log("got dispute")
     if not dispute:
         raise ValueError("No dispute found for ID: " + dispute_id)
     customer_email = dispute.get("customer_email")
     if not customer_email:
         raise ValueError("Dispute record has no customer_email.")
     user, loc, all_locs = get_account(customer_email)
-    _log("got account")
     if not loc:
         raise ValueError("No Homebase account found for: " + customer_email)
     company_id    = loc["company_id"]
     plan_history  = get_plan_history(company_id)
-    _log("got plan history")
     company_name  = get_company_name(company_id)
-    _log("got company name")
     all_locations = all_locs  # already fetched in get_account
     created = str(dispute.get("created_at") or "")[:10]
     # Use account creation date as period start to capture all activity
@@ -2073,15 +2064,10 @@ def _build_package_inner(dispute_id):
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
     act_summary, active_dates, last_active = {}, [], "--"
-    _log("skipped company-wide activity (will query by location after resolution)")
-    _log("fetching invoices")
     invoice_candidates = get_invoice_candidates(customer_email, dispute.get("customer_id"),
                                                 dispute.get("amount"), dispute.get("created_at"),
                                                 charge_id=dispute.get("charge_id"))
-    _log("got invoice candidates: " + str(len(invoice_candidates)))
-    _log("fetching charge history")
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
-    _log("got charge history")
 
     # Resolve disputed location and correct invoice together from all candidates.
     # This is the critical step: when multiple invoices have the same amount on the same
@@ -2089,22 +2075,18 @@ def _build_package_inner(dispute_id):
     # get_disputed_location_from_candidates scans all candidates and returns the invoice
     # whose location_id is in all_locs — ensuring both the location and invoice are correct.
     disputed_loc_resolved, invoices = get_disputed_location_from_candidates(invoice_candidates, all_locs)
-    _log("resolved disputed loc: " + str((disputed_loc_resolved or {}).get("location_id","none")))
     disputed_loc = disputed_loc_resolved or loc
 
     invoice_created = invoices.get("created") if invoices else None
 
     same_day_invoices = []
     if (dispute.get("reason") or "").lower() == "duplicate" and invoice_created:
-        _log("fetching same-day invoices (duplicate dispute)")
         same_day_invoices = get_same_day_invoices(
             dispute.get("customer_id",""), customer_email, invoice_created
         )
-        _log("got same-day invoices: " + str(len(same_day_invoices)))
 
     charge_date_ref = invoice_created or dispute.get("created_at")
-    _log("charge_date_ref: " + str(charge_date_ref))
-
+    charge_date_ref = invoice_created or dispute.get("created_at")
     if disputed_loc_resolved:
         disputed_loc_archived_at = disputed_loc_resolved.get("archived_at")
     else:
@@ -2124,47 +2106,32 @@ def _build_package_inner(dispute_id):
                 disputed_loc_archived_at = None
         else:
             disputed_loc_archived_at = None
-    _log("disputed_loc_archived_at: " + str(disputed_loc_archived_at))
 
     disputed_loc_id_for_activity = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
     if disputed_loc_id_for_activity:
-        _log("fetching location activity for " + str(disputed_loc_id_for_activity))
         act_summary, active_dates, last_active = get_activity_for_location(
             disputed_loc_id_for_activity, period_start, period_end
         )
-        _log("got location activity: " + str((act_summary or {}).get("total_active_days","?")))
-    else:
-        _log("no location ID — activity remains empty")
+    # else: activity remains empty defaults set above
 
-    _log("determining verdict")
     downgrade_within_window = False
     downgrade_date = None
     verdict = determine_verdict(dispute.get("reason"), disputed_loc_archived_at,
                                 dispute.get("evidence_due_date"), charge_date_ref)
-    _log("verdict: " + str(verdict))
-    _log("evaluating signals")
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
-    _log("checking payroll")
     charge_is_payroll = is_payroll_invoice(invoices)
-    _log("charge_is_payroll: " + str(charge_is_payroll))
     slug = dispute_id.replace("_","-")
-    _log("building PDF 1")
     pdf1 = pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals, company_name=company_name)
-    _log("building PDF 2")
     pdf2 = pdf_receipt(dispute, invoices, same_day_invoices,
                        active_loc_count=len([l for l in all_locs if not l.get("archived_at")]))
-    _log("building PDF 3")
     pdf3 = pdf_service_docs(dispute, user, loc, plan_history, all_locations, disputed_loc=disputed_loc_resolved)
-    _log("building PDF 4")
     pdf4 = pdf_policy(dispute, loc)
-    _log("all PDFs built")
     pkg = {
         slug + "_1_dispute_narrative.pdf":         pdf1,
         slug + "_2_dispute_receipt.pdf":            pdf2,
         slug + "_3_service_documentation.pdf":      pdf3,
         slug + "_4_refund_cancellation_policy.pdf": pdf4,
     }
-    _log("assembling pkg metadata")
     pkg["_signals"]               = signals
     pkg["_verdict"]               = verdict
     pkg["_charge_is_payroll"]     = charge_is_payroll
