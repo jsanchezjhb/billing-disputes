@@ -1702,6 +1702,8 @@ def _build_package_inner(dispute_id):
     invoice_candidates = get_invoice_candidates(customer_email, dispute.get("customer_id"),
                                                 dispute.get("amount"), dispute.get("created_at"),
                                                 charge_id=dispute.get("charge_id"))
+    _log("got invoice candidates: " + str(len(invoice_candidates)))
+    _log("fetching charge history")
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
     _log("got charge history")
 
