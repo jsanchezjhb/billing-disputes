@@ -1696,8 +1696,8 @@ def _build_package_inner(dispute_id):
     else:
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
-    act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
-    _log("got activity")
+    act_summary, active_dates, last_active = {}, [], "--"
+    _log("skipped company-wide activity (will query by location after resolution)")
     _log("fetching invoices")
     invoice_candidates = get_invoice_candidates(customer_email, dispute.get("customer_id"),
                                                 dispute.get("amount"), dispute.get("created_at"),
@@ -1763,7 +1763,9 @@ def _build_package_inner(dispute_id):
         act_summary, active_dates, last_active = get_activity_for_location(
             disputed_loc_id_for_activity, period_start, period_end
         )
-    # else act_summary/active_dates/last_active already set from company-wide query above
+        _log("got location activity")
+    else:
+        _log("no location ID — activity remains empty")
 
     # Verdict is based solely on whether the account was actually canceled (archived_at).
     # A downgrade to Tier 1 does NOT trigger a refund — the customer continued using the
