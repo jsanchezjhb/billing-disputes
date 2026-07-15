@@ -1780,12 +1780,21 @@ def _build_package_inner(dispute_id):
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
     charge_is_payroll = is_payroll_invoice(invoices)
     slug = dispute_id.replace("_","-")
+    _log("building PDF 1")
+    pdf1 = pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals, company_name=company_name)
+    _log("building PDF 2")
+    pdf2 = pdf_receipt(dispute, invoices, same_day_invoices,
+                       active_loc_count=len([l for l in all_locs if not l.get("archived_at")]))
+    _log("building PDF 3")
+    pdf3 = pdf_service_docs(dispute, user, loc, plan_history, all_locations, disputed_loc=disputed_loc_resolved)
+    _log("building PDF 4")
+    pdf4 = pdf_policy(dispute, loc)
+    _log("all PDFs built")
     pkg = {
-        slug + "_1_dispute_narrative.pdf":         pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals, company_name=company_name),
-        slug + "_2_dispute_receipt.pdf":            pdf_receipt(dispute, invoices, same_day_invoices,
-                                                                active_loc_count=len([l for l in all_locs if not l.get("archived_at")])),
-        slug + "_3_service_documentation.pdf":      pdf_service_docs(dispute, user, loc, plan_history, all_locations, disputed_loc=disputed_loc_resolved),
-        slug + "_4_refund_cancellation_policy.pdf": pdf_policy(dispute, loc),
+        slug + "_1_dispute_narrative.pdf":         pdf1,
+        slug + "_2_dispute_receipt.pdf":            pdf2,
+        slug + "_3_service_documentation.pdf":      pdf3,
+        slug + "_4_refund_cancellation_policy.pdf": pdf4,
     }
     pkg["_signals"]               = signals
     pkg["_verdict"]               = verdict
