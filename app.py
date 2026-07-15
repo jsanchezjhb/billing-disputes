@@ -1,5 +1,7 @@
 import io
 import os
+from contextvars import ContextVar
+_conn_var = ContextVar("db_conn", default=None)
 import dash
 from dash import dcc, html, Input, Output, State, callback_context
 from databricks import sql as databricks_sql
@@ -121,11 +123,16 @@ def run_query(sql_str, params=None, conn=None):
                 cols = [d[0] for d in cur.description]
                 return [dict(zip(cols, row)) for row in cur.fetchall()]
 
-        if conn is not None:
-            return _execute(conn)
+        # Use explicitly passed conn, then context-var conn, then open a new one
+        effective_conn = conn or _conn_var.get()
+        if effective_conn is not None:
+            return _execute(effective_conn)
         else:
-            with get_conn() as c:
+            c = get_conn()
+            try:
                 return _execute(c)
+            finally:
+                c.close()
     except Exception as e:
         raise RuntimeError(f"Query failed: {str(e)} | SQL: {sql_str[:300]}") from e
 
@@ -2018,31 +2025,28 @@ def pdf_policy(dispute, loc):
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 def build_package(dispute_id):
     from datetime import date, timedelta, datetime
-    # Open a single connection for the entire build — avoids 8-10 separate
-    # OAuth handshakes and warehouse cold-starts that cause spinner-forever hangs.
-    # Do NOT use `with get_conn()` — the Databricks connection context manager
-    # closes the connection on __exit__ immediately, before any queries run.
+    # Open one connection per build and set it in a ContextVar so all run_query
+    # calls in this async context reuse it — thread-safe, no global monkey-patch.
     _conn = get_conn()
-    _orig_run_query = globals()["run_query"]
-    def _run_query_with_conn(sql_str, params=None, conn=None):
-        return _orig_run_query(sql_str, params=params, conn=_conn)
-    globals()["run_query"] = _run_query_with_conn
+    token = _conn_var.set(_conn)
     try:
-        return _build_package_inner(dispute_id)
+        return _build_package_inner(dispute_id, _conn)
     finally:
-        globals()["run_query"] = _orig_run_query
+        _conn_var.reset(token)
         try:
             _conn.close()
         except Exception:
             pass
 
-def _build_package_inner(dispute_id):
+def _build_package_inner(dispute_id, _conn=None):
     import logging
     from datetime import date, timedelta, datetime
     logger = logging.getLogger("disputes")
     def _log(msg):
         logger.warning("[BUILD %s] %s", dispute_id[:12], msg)
         print(f"[BUILD {dispute_id[:12]}] {msg}", flush=True)
+    def rq(sql, params=None):
+        return run_query(sql, params=params, conn=_conn)
     _log("start")
     dispute = get_dispute(dispute_id)
     _log("got dispute")
