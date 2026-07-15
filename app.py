@@ -2037,19 +2037,29 @@ def build_package(dispute_id):
             pass
 
 def _build_package_inner(dispute_id):
+    import logging
     from datetime import date, timedelta, datetime
+    logger = logging.getLogger("disputes")
+    def _log(msg):
+        logger.warning("[BUILD %s] %s", dispute_id[:12], msg)
+        print(f"[BUILD {dispute_id[:12]}] {msg}", flush=True)
+    _log("start")
     dispute = get_dispute(dispute_id)
+    _log("got dispute")
     if not dispute:
         raise ValueError("No dispute found for ID: " + dispute_id)
     customer_email = dispute.get("customer_email")
     if not customer_email:
         raise ValueError("Dispute record has no customer_email.")
     user, loc, all_locs = get_account(customer_email)
+    _log("got account")
     if not loc:
         raise ValueError("No Homebase account found for: " + customer_email)
     company_id    = loc["company_id"]
     plan_history  = get_plan_history(company_id)
+    _log("got plan history")
     company_name  = get_company_name(company_id)
+    _log("got company name")
     all_locations = all_locs  # already fetched in get_account
     created = str(dispute.get("created_at") or "")[:10]
     # Use account creation date as period start to capture all activity
@@ -2064,9 +2074,11 @@ def _build_package_inner(dispute_id):
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
     act_summary, active_dates, last_active = {}, [], "--"
+    _log("fetching invoices")
     invoice_candidates = get_invoice_candidates(customer_email, dispute.get("customer_id"),
                                                 dispute.get("amount"), dispute.get("created_at"),
                                                 charge_id=dispute.get("charge_id"))
+    _log("got invoice candidates: " + str(len(invoice_candidates)))
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
 
     # Resolve disputed location and correct invoice together from all candidates.
@@ -2074,7 +2086,9 @@ def _build_package_inner(dispute_id):
     # date (per-location billing), each invoice's lines metadata has a different location_id.
     # get_disputed_location_from_candidates scans all candidates and returns the invoice
     # whose location_id is in all_locs — ensuring both the location and invoice are correct.
+    _log("got charge history")
     disputed_loc_resolved, invoices = get_disputed_location_from_candidates(invoice_candidates, all_locs)
+    _log("resolved loc: " + str((disputed_loc_resolved or {}).get("location_id","none")))
     disputed_loc = disputed_loc_resolved or loc
 
     invoice_created = invoices.get("created") if invoices else None
@@ -2108,24 +2122,33 @@ def _build_package_inner(dispute_id):
             disputed_loc_archived_at = None
 
     disputed_loc_id_for_activity = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
+    _log("fetching location activity")
     if disputed_loc_id_for_activity:
         act_summary, active_dates, last_active = get_activity_for_location(
             disputed_loc_id_for_activity, period_start, period_end
         )
     # else: activity remains empty defaults set above
+    _log("got activity")
 
+    _log("determining verdict")
     downgrade_within_window = False
     downgrade_date = None
     verdict = determine_verdict(dispute.get("reason"), disputed_loc_archived_at,
                                 dispute.get("evidence_due_date"), charge_date_ref)
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
     charge_is_payroll = is_payroll_invoice(invoices)
+    _log("verdict: " + str(verdict))
     slug = dispute_id.replace("_","-")
+    _log("building PDF 1")
     pdf1 = pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals, company_name=company_name)
+    _log("building PDF 2")
     pdf2 = pdf_receipt(dispute, invoices, same_day_invoices,
                        active_loc_count=len([l for l in all_locs if not l.get("archived_at")]))
+    _log("building PDF 3")
     pdf3 = pdf_service_docs(dispute, user, loc, plan_history, all_locations, disputed_loc=disputed_loc_resolved)
+    _log("building PDF 4")
     pdf4 = pdf_policy(dispute, loc)
+    _log("all PDFs built")
     pkg = {
         slug + "_1_dispute_narrative.pdf":         pdf1,
         slug + "_2_dispute_receipt.pdf":            pdf2,
@@ -2158,6 +2181,7 @@ def _build_package_inner(dispute_id):
     pkg["_disputed_location_id"]  = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
     pkg["_disputed_location_name"] = (disputed_loc_resolved or disputed_loc or {}).get("name","")
     pkg["_disputed_loc_resolved"] = disputed_loc_resolved is not None
+    _log("done")
     return pkg
 
 # ── Dash app ──────────────────────────────────────────────────────────────────
