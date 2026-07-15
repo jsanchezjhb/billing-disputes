@@ -1661,19 +1661,28 @@ def build_package(dispute_id):
             pass
 
 def _build_package_inner(dispute_id):
+    import time
     from datetime import date, timedelta, datetime
+    def _log(msg):
+        print(f"[BUILD {dispute_id[:12]}] {msg}", flush=True)
+
+    _log("start")
     dispute = get_dispute(dispute_id)
+    _log("got dispute")
     if not dispute:
         raise ValueError("No dispute found for ID: " + dispute_id)
     customer_email = dispute.get("customer_email")
     if not customer_email:
         raise ValueError("Dispute record has no customer_email.")
     user, loc, all_locs = get_account(customer_email)
+    _log("got account")
     if not loc:
         raise ValueError("No Homebase account found for: " + customer_email)
     company_id    = loc["company_id"]
     plan_history  = get_plan_history(company_id)
+    _log("got plan history")
     company_name  = get_company_name(company_id)
+    _log("got company name")
     all_locations = all_locs  # already fetched in get_account
     created = str(dispute.get("created_at") or "")[:10]
     # Use account creation date as period start to capture all activity
@@ -1688,10 +1697,13 @@ def _build_package_inner(dispute_id):
         period_start = str(date.today() - timedelta(days=365))
     period_end = str(date.today())
     act_summary, active_dates, last_active = get_activity(company_id, period_start, period_end)
+    _log("got activity")
+    _log("fetching invoices")
     invoice_candidates = get_invoice_candidates(customer_email, dispute.get("customer_id"),
                                                 dispute.get("amount"), dispute.get("created_at"),
                                                 charge_id=dispute.get("charge_id"))
     charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
+    _log("got charge history")
 
     # Resolve disputed location and correct invoice together from all candidates.
     # This is the critical step: when multiple invoices have the same amount on the same
@@ -1699,6 +1711,7 @@ def _build_package_inner(dispute_id):
     # get_disputed_location_from_candidates scans all candidates and returns the invoice
     # whose location_id is in all_locs — ensuring both the location and invoice are correct.
     disputed_loc_resolved, invoices = get_disputed_location_from_candidates(invoice_candidates, all_locs)
+    _log("resolved disputed loc")
     # invoices is now the matched invoice (or first candidate as fallback)
     disputed_loc = disputed_loc_resolved or loc  # for PDF display only
 
