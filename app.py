@@ -194,7 +194,13 @@ def get_invoice_candidates(customer_email, customer_id=None, dispute_amount=None
         except (ValueError, TypeError):
             pass
 
-    date_filter = (" AND created < '" + str(dispute_ts) + "'" if dispute_ts else "")
+    # Add both upper bound (pre-dispute) and lower bound (2 years) to avoid full table scan
+    from datetime import datetime, timezone, timedelta
+    cutoff_lower = int((datetime.now(timezone.utc) - timedelta(days=730)).timestamp())
+    if dispute_ts:
+        date_filter = " AND created > '" + str(cutoff_lower) + "' AND created < '" + str(dispute_ts) + "'"
+    else:
+        date_filter = " AND created > '" + str(cutoff_lower) + "'"
 
     if customer_id and amount_cents:
         rows = run_query(
@@ -331,15 +337,18 @@ def get_disputed_location_from_candidates(invoice_candidates, all_locs):
     return None, invoice_candidates[0]
 
 def get_charge_history(customer_id, customer_email, limit=12):
-    """Fetch prior successful charges for this customer from stripe.invoice."""
-    # LIMIT must be inlined as integer, not passed as param (Databricks rejects string LIMIT)
+    """Fetch prior successful charges — scoped to last 24 months to avoid full table scan."""
     lim = int(limit)
+    from datetime import datetime, timezone, timedelta
+    cutoff = int((datetime.now(timezone.utc) - timedelta(days=730)).timestamp())
+    date_filter = " AND created > '" + str(cutoff) + "'"
     rows = run_query(
         "SELECT number, amount_paid, period_start, period_end, "
         "created, status, billing_reason, charge "
         "FROM " + INVOICE_TABLE + " "
-        "WHERE customer = :cid AND paid = 'true' AND amount_paid > '0' "
-        "ORDER BY created DESC LIMIT " + str(lim),
+        "WHERE customer = :cid AND paid = 'true' AND amount_paid > '0'"
+        + date_filter +
+        " ORDER BY created DESC LIMIT " + str(lim),
         {"cid": customer_id},
     )
     if not rows:
@@ -348,384 +357,9 @@ def get_charge_history(customer_id, customer_email, limit=12):
             "created, status, billing_reason, charge "
             "FROM " + INVOICE_TABLE + " "
             "WHERE LOWER(customer_email) = LOWER(:email) "
-            "AND paid = 'true' AND amount_paid > '0' "
-            "ORDER BY created DESC LIMIT " + str(lim),
-            {"email": customer_email},
-        )
-    return rows or []
-
-def get_same_day_invoices(customer_id, customer_email, charge_date_unix):
-    """
-    For duplicate disputes: fetch ALL paid invoices for this customer within
-    a ±3 day window of the disputed charge. Widened from a strict 24-hour window
-    because duplicate disputes often arise from upgrade/proration events where
-    Stripe generates two invoices (subscription_update + subscription_cycle)
-    within a short window that may span midnight UTC or occur days apart.
-    Each invoice represents a separate per-location or per-event charge.
-    charge_date_unix: the unix timestamp of the disputed invoice's created date.
-    """
-    if not charge_date_unix:
-        return []
-    try:
-        from datetime import datetime, timezone, timedelta
-        charge_dt = datetime.fromtimestamp(int(charge_date_unix), tz=timezone.utc)
-        # ±3 day window — wide enough to catch split upgrade/proration events
-        window_start = int((charge_dt - timedelta(days=3)).timestamp())
-        window_end   = int((charge_dt + timedelta(days=3)).timestamp())
-    except (ValueError, TypeError):
-        return []
-
-    rows = run_query(
-        "SELECT id, number, status, amount_paid, amount_due, total, "
-        "currency, period_start, period_end, billing_reason, lines, "
-        "customer_name, customer_email, subscription, charge, "
-        "receipt_number, hosted_invoice_url, created, paid "
-        "FROM " + INVOICE_TABLE + " "
-        "WHERE customer = :cid AND paid = 'true' AND amount_paid > '0' "
-        "AND created >= '" + str(window_start) + "' AND created < '" + str(window_end) + "' "
-        "ORDER BY created ASC LIMIT 20",
-        {"cid": customer_id},
-    )
-    if not rows and customer_email:
-        rows = run_query(
-            "SELECT id, number, status, amount_paid, amount_due, total, "
-            "currency, period_start, period_end, billing_reason, lines, "
-            "customer_name, customer_email, subscription, charge, "
-            "receipt_number, hosted_invoice_url, created, paid "
-            "FROM " + INVOICE_TABLE + " "
-            "WHERE LOWER(customer_email) = LOWER(:email) AND paid = 'true' AND amount_paid > '0' "
-            "AND created >= '" + str(window_start) + "' AND created < '" + str(window_end) + "' "
-            "ORDER BY created ASC LIMIT 20",
-            {"email": customer_email},
-        )
-    return rows or []
-
-
-def get_account(customer_email):
-    users = run_query(
-        "SELECT user_id, first_name, last_name, email, created_at, last_sign_in_at, "
-        "last_sign_in_ip, mobile_last_used_at, mobile_last_used_info, "
-        "web_sign_in_count, sign_in_count, highest_level_location "
-        "FROM " + USERS_TABLE + " WHERE LOWER(email) = LOWER(:email)",
-        {"email": customer_email},
-    )
-    if not users:
-        return None, None, None
-    user = users[0]
-
-    # Get primary location to resolve company_id
-    locs = run_query(
-        "SELECT location_id, company_id, name, created_at, archived_at, "
-        "active_now, tier_id, billing_source, mau "
-        "FROM " + LOCATIONS_TABLE + " WHERE owner_id = :uid "
-        "ORDER BY created_at ASC",
-        {"uid": user["user_id"]},
-    )
-    if not locs and user.get("highest_level_location"):
-        locs = run_query(
-            "SELECT location_id, company_id, name, created_at, archived_at, "
-            "active_now, tier_id, billing_source, mau "
-            "FROM " + LOCATIONS_TABLE + " WHERE location_id = :lid",
-            {"lid": user["highest_level_location"]},
-        )
-    if not locs:
-        return user, None, []
-
-    primary_loc = locs[0]
-    company_id  = primary_loc["company_id"]
-
-    # Get ALL locations for this company (cap at 100 to avoid timeout on large accounts)
-    all_locs = run_query(
-        "SELECT location_id, company_id, name, created_at, archived_at, "
-        "active_now, tier_id, billing_source, mau "
-        "FROM " + LOCATIONS_TABLE + " WHERE company_id = :cid "
-        "ORDER BY archived_at ASC NULLS FIRST, created_at ASC "
-        "LIMIT 100",
-        {"cid": company_id},
-    )
-
-    return user, primary_loc, all_locs
-
-def tier_name(val):
-    if val is None or val == "--": return "--"
-    name = TIER_NAMES.get(val) or TIER_NAMES.get(str(val))
-    return (name + " (" + str(val) + ")") if name else str(val)
-
-# ── Connection ────────────────────────────────────────────────────────────────
-def get_conn():
-    from databricks.sdk.core import Config
-    cfg = Config()
-    return databricks_sql.connect(
-        server_hostname=cfg.host,
-        http_path=DATABRICKS_HTTP_PATH,
-        credentials_provider=lambda: cfg.authenticate,
-        _socket_timeout=120,
-        connection_timeout=120,
-    )
-
-def wake_warehouse():
-    """Run a trivial query at app startup to wake the warehouse before any user submits.
-    Runs in a background thread so it doesn't block the app from loading."""
-    import threading
-    def _ping():
-        try:
-            conn = get_conn()
-            with conn.cursor() as cur:
-                cur.execute("SELECT 1")
-            conn.close()
-        except Exception:
-            pass  # Silently ignore — warehouse will wake on first real request
-    threading.Thread(target=_ping, daemon=True).start()
-
-def esc(val):
-    if val is None:
-        return "NULL"
-    if isinstance(val, (int, float)):
-        return str(val)
-    return "'" + str(val).replace("'", "''") + "'"
-
-def run_query(sql_str, params=None, conn=None):
-    if params:
-        for key, val in params.items():
-            sql_str = sql_str.replace(":" + key, esc(val))
-    try:
-        def _execute(c):
-            with c.cursor() as cur:
-                cur.execute(sql_str)
-                if cur.description is None:
-                    return []
-                cols = [d[0] for d in cur.description]
-                return [dict(zip(cols, row)) for row in cur.fetchall()]
-
-        if conn is not None:
-            return _execute(conn)
-        else:
-            with get_conn() as c:
-                return _execute(c)
-    except Exception as e:
-        raise RuntimeError(f"Query failed: {str(e)} | SQL: {sql_str[:300]}") from e
-
-def fmt(val):
-    if val is None:
-        return "--"
-    return str(val)[:10]
-
-# ── DB lookups ────────────────────────────────────────────────────────────────
-def get_dispute(dispute_id):
-    rows = run_query(
-        "SELECT dispute_id, amount, status, reason, customer_name, customer_id, "
-        "customer_email, created_at, last_updated_at, evidence_due_date, charge_id "
-        "FROM " + DISPUTES_TABLE + " WHERE dispute_id = :did",
-        {"did": dispute_id},
-    )
-    if not rows:
-        return None
-    row = dict(rows[0])
-    try:
-        amt = row["amount"]
-        row["amount"] = "$" + "{:.2f}".format(int(amt) / 100)
-    except (TypeError, ValueError):
-        pass
-    return row
-
-def get_invoice_candidates(customer_email, customer_id=None, dispute_amount=None, dispute_created_at=None, charge_id=None):
-    """Return the matching invoice(s) for this dispute.
-    Primary: match by charge_id — guaranteed 1:1 with the disputed transaction.
-    Fallback: customer+amount filtered to pre-dispute invoices, ordered by period_end DESC.
-    """
-    amount_cents = None
-    if dispute_amount:
-        try:
-            amount_cents = str(int(round(float(dispute_amount.replace("$","")) * 100)))
-        except (ValueError, AttributeError):
-            pass
-
-    SELECT_COLS = (
-        "SELECT id, number, status, amount_paid, amount_due, total, "
-        "currency, period_start, period_end, billing_reason, lines, "
-        "customer_name, customer_email, subscription, charge, "
-        "receipt_number, hosted_invoice_url, created, paid "
-        "FROM " + INVOICE_TABLE + " "
-    )
-
-    # Primary: charge_id uniquely identifies the exact invoice — no ambiguity
-    if charge_id:
-        rows = run_query(
-            SELECT_COLS + "WHERE charge = :chg AND paid = 'true' LIMIT 1",
-            {"chg": charge_id},
-        )
-        if rows:
-            return rows
-
-    # Fallback: customer+amount filtered to pre-dispute invoices
-    dispute_ts = None
-    if dispute_created_at:
-        try:
-            from datetime import datetime, timezone
-            if str(dispute_created_at).lstrip("-").isdigit():
-                dispute_ts = int(dispute_created_at)
-            else:
-                dt = datetime.strptime(str(dispute_created_at)[:19], "%Y-%m-%dT%H:%M:%S")
-                dispute_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
-        except (ValueError, TypeError):
-            pass
-
-    date_filter = (" AND created < '" + str(dispute_ts) + "'" if dispute_ts else "")
-
-    if customer_id and amount_cents:
-        rows = run_query(
-            SELECT_COLS +
-            "WHERE customer = :cid AND amount_paid = :amt AND paid = 'true'" +
-            date_filter +
-            " ORDER BY period_end DESC LIMIT 20",
-            {"cid": customer_id, "amt": amount_cents},
-        )
-        if rows:
-            return rows
-
-    if amount_cents:
-        rows = run_query(
-            SELECT_COLS +
-            "WHERE LOWER(customer_email) = LOWER(:email) AND amount_paid = :amt AND paid = 'true'" +
-            date_filter +
-            " ORDER BY period_end DESC LIMIT 20",
-            {"email": customer_email, "amt": amount_cents},
-        )
-        if rows:
-            return rows
-
-    # Last resort: most recent paid invoice before dispute
-    if customer_id:
-        rows = run_query(
-            SELECT_COLS +
-            "WHERE customer = :cid AND paid = 'true'" +
-            date_filter +
-            " ORDER BY period_end DESC LIMIT 1",
-            {"cid": customer_id},
-        )
-        if rows:
-            return rows
-
-    return []
-
-def get_invoice(customer_email, customer_id=None, dispute_amount=None, charge_id=None):
-    """Return the single best invoice — used for the receipt PDF and charge date.
-    Defers to get_invoice_candidates + first result as fallback when no location
-    matching is possible yet (e.g. before all_locs is available).
-    The real invoice selection happens in get_disputed_location_from_candidates.
-    """
-    candidates = get_invoice_candidates(customer_email, customer_id, dispute_amount)
-    return candidates[0] if candidates else None
-
-def get_disputed_location(invoices_row, all_locs):
-    """Single-invoice wrapper — kept for compatibility. Delegates to the multi-candidate version."""
-    if not invoices_row:
-        return None
-    result, _ = get_disputed_location_from_candidates([invoices_row], all_locs)
-    return result
-
-
-def get_disputed_location_from_candidates(invoice_candidates, all_locs):
-    """
-    Given a list of invoice candidates (same customer+amount, pre-dispute), find the one
-    whose lines subscription metadata location_id matches a location in all_locs.
-
-    Scoring per candidate invoice:
-      - Subscription-type line with amount > 0 and a matching location_id: score 0 (best)
-      - Other line types: score 1
-    Among equal-score matches, prefer latest period_end (most recent billing period).
-
-    Returns (location_dict, invoice_dict).
-    """
-    import json
-    if not invoice_candidates:
-        return None, None
-    if not all_locs:
-        return None, invoice_candidates[0]
-
-    all_locs_by_id = {l.get("location_id"): l for l in all_locs}
-
-    # Build scored list of (priority, period_end, location, invoice)
-    scored = []
-    for inv in invoice_candidates:
-        lines_raw = inv.get("lines")
-        if not lines_raw:
-            continue
-        try:
-            lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
-            data = lines.get("data", []) if isinstance(lines, dict) else []
-            for item in data:
-                meta = item.get("metadata", {}) or {}
-                loc_id = meta.get("location_id")
-                if not loc_id:
-                    continue
-                try:
-                    loc_id_int = int(loc_id)
-                except (ValueError, TypeError):
-                    continue
-                if loc_id_int not in all_locs_by_id:
-                    continue
-                item_type = item.get("type", "")
-                amount    = item.get("amount", 0) or 0
-                priority  = 0 if (item_type == "subscription" and amount > 0) else 1
-                # Use period_end as tiebreaker — most recent billing period wins
-                try:
-                    period_end = int(inv.get("period_end") or 0)
-                except (ValueError, TypeError):
-                    period_end = 0
-                scored.append((priority, -period_end, all_locs_by_id[loc_id_int], inv))
-        except (json.JSONDecodeError, ValueError, TypeError):
-            continue
-
-    if scored:
-        scored.sort(key=lambda x: (x[0], x[1]))
-        return scored[0][2], scored[0][3]
-
-    # location_id found but not in all_locs (account > 100 locations) — DB fetch
-    for inv in invoice_candidates:
-        lines_raw = inv.get("lines")
-        if not lines_raw:
-            continue
-        try:
-            lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
-            data = lines.get("data", []) if isinstance(lines, dict) else []
-            for item in data:
-                meta = item.get("metadata", {}) or {}
-                loc_id = meta.get("location_id")
-                if loc_id and item.get("type") == "subscription" and (item.get("amount") or 0) > 0:
-                    rows = run_query(
-                        "SELECT location_id, company_id, name, created_at, archived_at, "
-                        "active_now, tier_id, billing_source, mau "
-                        "FROM " + LOCATIONS_TABLE + " WHERE location_id = :lid",
-                        {"lid": int(loc_id)},
-                    )
-                    if rows:
-                        return rows[0], inv
-        except (json.JSONDecodeError, ValueError, TypeError):
-            continue
-
-    return None, invoice_candidates[0]
-
-def get_charge_history(customer_id, customer_email, limit=12):
-    """Fetch prior successful charges for this customer from stripe.invoice."""
-    # LIMIT must be inlined as integer, not passed as param (Databricks rejects string LIMIT)
-    lim = int(limit)
-    rows = run_query(
-        "SELECT number, amount_paid, period_start, period_end, "
-        "created, status, billing_reason, charge "
-        "FROM " + INVOICE_TABLE + " "
-        "WHERE customer = :cid AND paid = 'true' AND amount_paid > '0' "
-        "ORDER BY created DESC LIMIT " + str(lim),
-        {"cid": customer_id},
-    )
-    if not rows:
-        rows = run_query(
-            "SELECT number, amount_paid, period_start, period_end, "
-            "created, status, billing_reason, charge "
-            "FROM " + INVOICE_TABLE + " "
-            "WHERE LOWER(customer_email) = LOWER(:email) "
-            "AND paid = 'true' AND amount_paid > '0' "
-            "ORDER BY created DESC LIMIT " + str(lim),
+            "AND paid = 'true' AND amount_paid > '0'"
+            + date_filter +
+            " ORDER BY created DESC LIMIT " + str(lim),
             {"email": customer_email},
         )
     return rows or []
@@ -826,7 +460,7 @@ def get_plan_history(company_id):
     return run_query(
         "SELECT location_id, type, start_tier, end_tier, old_subscription_type, "
         "new_subscription_type, created_at "
-        "FROM " + UPGRADES_TABLE + " WHERE company_id = :cid ORDER BY created_at DESC",
+        "FROM " + UPGRADES_TABLE + " WHERE company_id = :cid ORDER BY created_at DESC LIMIT 200",
         {"cid": company_id},
     )
 
@@ -951,45 +585,6 @@ def is_payroll_invoice(invoices_row):
     except (json.JSONDecodeError, ValueError, TypeError):
         pass
     return False
-
-def get_activity(company_id, period_start, period_end):
-    # Get location IDs for this company first, then query activity by location_id
-    # This avoids relying on company_id being present in fact_locations_by_day
-    loc_id_rows = run_query(
-        "SELECT location_id FROM " + LOCATIONS_TABLE + " WHERE company_id = :cid",
-        {"cid": company_id},
-    )
-    loc_ids = [str(r["location_id"]) for r in loc_id_rows] if loc_id_rows else ["0"]
-    loc_ids_str = ", ".join(loc_ids)
-
-    summary = run_query(
-        "SELECT COUNT(DISTINCT CAST(date AS DATE)) AS total_active_days, "
-        "COUNT(DISTINCT CASE WHEN web_active_on_day = 1 THEN CAST(date AS DATE) END) AS web_active_days, "
-        "COUNT(DISTINCT CASE WHEN mobile_active_on_day = 1 THEN CAST(date AS DATE) END) AS mobile_active_days, "
-        "COUNT(DISTINCT CASE WHEN scheduling_active_on_day = 1 THEN CAST(date AS DATE) END) AS scheduling_active_days "
-        "FROM " + ACTIVITY_TABLE + " "
-        "WHERE location_id IN (" + loc_ids_str + ") AND date BETWEEN :start AND :end "
-        "AND active_on_day = 1",
-        {"start": period_start, "end": period_end},
-    )
-    dates = run_query(
-        "SELECT DISTINCT CAST(date AS DATE) AS active_date "
-        "FROM " + ACTIVITY_TABLE + " "
-        "WHERE location_id IN (" + loc_ids_str + ") AND date BETWEEN :start AND :end "
-        "AND active_on_day = 1 ORDER BY active_date DESC",
-        {"start": period_start, "end": period_end},
-    )
-    last = run_query(
-        "SELECT CAST(MAX(date) AS DATE) AS last_date "
-        "FROM " + ACTIVITY_TABLE + " "
-        "WHERE location_id IN (" + loc_ids_str + ") AND active_on_day = 1",
-        {},
-    )
-    return (
-        summary[0] if summary else {},
-        [fmt(r["active_date"]) for r in dates],
-        fmt(last[0]["last_date"]) if last and last[0].get("last_date") else "--",
-    )
 
 def determine_verdict(reason, archived_at, evidence_due_date, dispute_created=None):
     r = (reason or "").lower()
