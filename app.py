@@ -446,6 +446,382 @@ def get_account(customer_email):
 
     return user, primary_loc, all_locs
 
+def tier_name(val):
+    if val is None or val == "--": return "--"
+    name = TIER_NAMES.get(val) or TIER_NAMES.get(str(val))
+    return (name + " (" + str(val) + ")") if name else str(val)
+
+# ── Connection ────────────────────────────────────────────────────────────────
+def get_conn():
+    from databricks.sdk.core import Config
+    cfg = Config()
+    return databricks_sql.connect(
+        server_hostname=cfg.host,
+        http_path=DATABRICKS_HTTP_PATH,
+        credentials_provider=lambda: cfg.authenticate,
+        _socket_timeout=120,
+        connection_timeout=120,
+    )
+
+def wake_warehouse():
+    """Run a trivial query at app startup to wake the warehouse before any user submits.
+    Runs in a background thread so it doesn't block the app from loading."""
+    import threading
+    def _ping():
+        try:
+            conn = get_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.close()
+        except Exception:
+            pass  # Silently ignore — warehouse will wake on first real request
+    threading.Thread(target=_ping, daemon=True).start()
+
+def esc(val):
+    if val is None:
+        return "NULL"
+    if isinstance(val, (int, float)):
+        return str(val)
+    return "'" + str(val).replace("'", "''") + "'"
+
+def run_query(sql_str, params=None, conn=None):
+    if params:
+        for key, val in params.items():
+            sql_str = sql_str.replace(":" + key, esc(val))
+    try:
+        def _execute(c):
+            with c.cursor() as cur:
+                cur.execute(sql_str)
+                if cur.description is None:
+                    return []
+                cols = [d[0] for d in cur.description]
+                return [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        if conn is not None:
+            return _execute(conn)
+        else:
+            with get_conn() as c:
+                return _execute(c)
+    except Exception as e:
+        raise RuntimeError(f"Query failed: {str(e)} | SQL: {sql_str[:300]}") from e
+
+def fmt(val):
+    if val is None:
+        return "--"
+    return str(val)[:10]
+
+# ── DB lookups ────────────────────────────────────────────────────────────────
+def get_dispute(dispute_id):
+    rows = run_query(
+        "SELECT dispute_id, amount, status, reason, customer_name, customer_id, "
+        "customer_email, created_at, last_updated_at, evidence_due_date, charge_id "
+        "FROM " + DISPUTES_TABLE + " WHERE dispute_id = :did",
+        {"did": dispute_id},
+    )
+    if not rows:
+        return None
+    row = dict(rows[0])
+    try:
+        amt = row["amount"]
+        row["amount"] = "$" + "{:.2f}".format(int(amt) / 100)
+    except (TypeError, ValueError):
+        pass
+    return row
+
+def get_invoice_candidates(customer_email, customer_id=None, dispute_amount=None, dispute_created_at=None, charge_id=None):
+    """Return the matching invoice(s) for this dispute.
+    Primary: match by charge_id — guaranteed 1:1 with the disputed transaction.
+    Fallback: customer+amount filtered to pre-dispute invoices, ordered by period_end DESC.
+    """
+    amount_cents = None
+    if dispute_amount:
+        try:
+            amount_cents = str(int(round(float(dispute_amount.replace("$","")) * 100)))
+        except (ValueError, AttributeError):
+            pass
+
+    SELECT_COLS = (
+        "SELECT id, number, status, amount_paid, amount_due, total, "
+        "currency, period_start, period_end, billing_reason, lines, "
+        "customer_name, customer_email, subscription, charge, "
+        "receipt_number, hosted_invoice_url, created, paid "
+        "FROM " + INVOICE_TABLE + " "
+    )
+
+    # Primary: charge_id uniquely identifies the exact invoice — no ambiguity
+    if charge_id:
+        rows = run_query(
+            SELECT_COLS + "WHERE charge = :chg AND paid = 'true' LIMIT 1",
+            {"chg": charge_id},
+        )
+        if rows:
+            return rows
+
+    # Fallback: customer+amount filtered to pre-dispute invoices
+    dispute_ts = None
+    if dispute_created_at:
+        try:
+            from datetime import datetime, timezone
+            if str(dispute_created_at).lstrip("-").isdigit():
+                dispute_ts = int(dispute_created_at)
+            else:
+                dt = datetime.strptime(str(dispute_created_at)[:19], "%Y-%m-%dT%H:%M:%S")
+                dispute_ts = int(dt.replace(tzinfo=timezone.utc).timestamp())
+        except (ValueError, TypeError):
+            pass
+
+    date_filter = (" AND created < '" + str(dispute_ts) + "'" if dispute_ts else "")
+
+    if customer_id and amount_cents:
+        rows = run_query(
+            SELECT_COLS +
+            "WHERE customer = :cid AND amount_paid = :amt AND paid = 'true'" +
+            date_filter +
+            " ORDER BY period_end DESC LIMIT 20",
+            {"cid": customer_id, "amt": amount_cents},
+        )
+        if rows:
+            return rows
+
+    if amount_cents:
+        rows = run_query(
+            SELECT_COLS +
+            "WHERE LOWER(customer_email) = LOWER(:email) AND amount_paid = :amt AND paid = 'true'" +
+            date_filter +
+            " ORDER BY period_end DESC LIMIT 20",
+            {"email": customer_email, "amt": amount_cents},
+        )
+        if rows:
+            return rows
+
+    # Last resort: most recent paid invoice before dispute
+    if customer_id:
+        rows = run_query(
+            SELECT_COLS +
+            "WHERE customer = :cid AND paid = 'true'" +
+            date_filter +
+            " ORDER BY period_end DESC LIMIT 1",
+            {"cid": customer_id},
+        )
+        if rows:
+            return rows
+
+    return []
+
+def get_invoice(customer_email, customer_id=None, dispute_amount=None, charge_id=None):
+    """Return the single best invoice — used for the receipt PDF and charge date.
+    Defers to get_invoice_candidates + first result as fallback when no location
+    matching is possible yet (e.g. before all_locs is available).
+    The real invoice selection happens in get_disputed_location_from_candidates.
+    """
+    candidates = get_invoice_candidates(customer_email, customer_id, dispute_amount)
+    return candidates[0] if candidates else None
+
+def get_disputed_location(invoices_row, all_locs):
+    """Single-invoice wrapper — kept for compatibility. Delegates to the multi-candidate version."""
+    if not invoices_row:
+        return None
+    result, _ = get_disputed_location_from_candidates([invoices_row], all_locs)
+    return result
+
+
+def get_disputed_location_from_candidates(invoice_candidates, all_locs):
+    """
+    Given a list of invoice candidates (same customer+amount, pre-dispute), find the one
+    whose lines subscription metadata location_id matches a location in all_locs.
+
+    Scoring per candidate invoice:
+      - Subscription-type line with amount > 0 and a matching location_id: score 0 (best)
+      - Other line types: score 1
+    Among equal-score matches, prefer latest period_end (most recent billing period).
+
+    Returns (location_dict, invoice_dict).
+    """
+    import json
+    if not invoice_candidates:
+        return None, None
+    if not all_locs:
+        return None, invoice_candidates[0]
+
+    all_locs_by_id = {l.get("location_id"): l for l in all_locs}
+
+    # Build scored list of (priority, period_end, location, invoice)
+    scored = []
+    for inv in invoice_candidates:
+        lines_raw = inv.get("lines")
+        if not lines_raw:
+            continue
+        try:
+            lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
+            data = lines.get("data", []) if isinstance(lines, dict) else []
+            for item in data:
+                meta = item.get("metadata", {}) or {}
+                loc_id = meta.get("location_id")
+                if not loc_id:
+                    continue
+                try:
+                    loc_id_int = int(loc_id)
+                except (ValueError, TypeError):
+                    continue
+                if loc_id_int not in all_locs_by_id:
+                    continue
+                item_type = item.get("type", "")
+                amount    = item.get("amount", 0) or 0
+                priority  = 0 if (item_type == "subscription" and amount > 0) else 1
+                # Use period_end as tiebreaker — most recent billing period wins
+                try:
+                    period_end = int(inv.get("period_end") or 0)
+                except (ValueError, TypeError):
+                    period_end = 0
+                scored.append((priority, -period_end, all_locs_by_id[loc_id_int], inv))
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+
+    if scored:
+        scored.sort(key=lambda x: (x[0], x[1]))
+        return scored[0][2], scored[0][3]
+
+    # location_id found but not in all_locs (account > 100 locations) — DB fetch
+    for inv in invoice_candidates:
+        lines_raw = inv.get("lines")
+        if not lines_raw:
+            continue
+        try:
+            lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
+            data = lines.get("data", []) if isinstance(lines, dict) else []
+            for item in data:
+                meta = item.get("metadata", {}) or {}
+                loc_id = meta.get("location_id")
+                if loc_id and item.get("type") == "subscription" and (item.get("amount") or 0) > 0:
+                    rows = run_query(
+                        "SELECT location_id, company_id, name, created_at, archived_at, "
+                        "active_now, tier_id, billing_source, mau "
+                        "FROM " + LOCATIONS_TABLE + " WHERE location_id = :lid",
+                        {"lid": int(loc_id)},
+                    )
+                    if rows:
+                        return rows[0], inv
+        except (json.JSONDecodeError, ValueError, TypeError):
+            continue
+
+    return None, invoice_candidates[0]
+
+def get_charge_history(customer_id, customer_email, limit=12):
+    """Fetch prior successful charges for this customer from stripe.invoice."""
+    # LIMIT must be inlined as integer, not passed as param (Databricks rejects string LIMIT)
+    lim = int(limit)
+    rows = run_query(
+        "SELECT number, amount_paid, period_start, period_end, "
+        "created, status, billing_reason, charge "
+        "FROM " + INVOICE_TABLE + " "
+        "WHERE customer = :cid AND paid = 'true' AND amount_paid > '0' "
+        "ORDER BY created DESC LIMIT " + str(lim),
+        {"cid": customer_id},
+    )
+    if not rows:
+        rows = run_query(
+            "SELECT number, amount_paid, period_start, period_end, "
+            "created, status, billing_reason, charge "
+            "FROM " + INVOICE_TABLE + " "
+            "WHERE LOWER(customer_email) = LOWER(:email) "
+            "AND paid = 'true' AND amount_paid > '0' "
+            "ORDER BY created DESC LIMIT " + str(lim),
+            {"email": customer_email},
+        )
+    return rows or []
+
+def get_same_day_invoices(customer_id, customer_email, charge_date_unix):
+    """
+    For duplicate disputes: fetch ALL paid invoices for this customer within
+    a ±3 day window of the disputed charge. Widened from a strict 24-hour window
+    because duplicate disputes often arise from upgrade/proration events where
+    Stripe generates two invoices (subscription_update + subscription_cycle)
+    within a short window that may span midnight UTC or occur days apart.
+    Each invoice represents a separate per-location or per-event charge.
+    charge_date_unix: the unix timestamp of the disputed invoice's created date.
+    """
+    if not charge_date_unix:
+        return []
+    try:
+        from datetime import datetime, timezone, timedelta
+        charge_dt = datetime.fromtimestamp(int(charge_date_unix), tz=timezone.utc)
+        # ±3 day window — wide enough to catch split upgrade/proration events
+        window_start = int((charge_dt - timedelta(days=3)).timestamp())
+        window_end   = int((charge_dt + timedelta(days=3)).timestamp())
+    except (ValueError, TypeError):
+        return []
+
+    rows = run_query(
+        "SELECT id, number, status, amount_paid, amount_due, total, "
+        "currency, period_start, period_end, billing_reason, lines, "
+        "customer_name, customer_email, subscription, charge, "
+        "receipt_number, hosted_invoice_url, created, paid "
+        "FROM " + INVOICE_TABLE + " "
+        "WHERE customer = :cid AND paid = 'true' AND amount_paid > '0' "
+        "AND created >= '" + str(window_start) + "' AND created < '" + str(window_end) + "' "
+        "ORDER BY created ASC LIMIT 20",
+        {"cid": customer_id},
+    )
+    if not rows and customer_email:
+        rows = run_query(
+            "SELECT id, number, status, amount_paid, amount_due, total, "
+            "currency, period_start, period_end, billing_reason, lines, "
+            "customer_name, customer_email, subscription, charge, "
+            "receipt_number, hosted_invoice_url, created, paid "
+            "FROM " + INVOICE_TABLE + " "
+            "WHERE LOWER(customer_email) = LOWER(:email) AND paid = 'true' AND amount_paid > '0' "
+            "AND created >= '" + str(window_start) + "' AND created < '" + str(window_end) + "' "
+            "ORDER BY created ASC LIMIT 20",
+            {"email": customer_email},
+        )
+    return rows or []
+
+
+def get_account(customer_email):
+    users = run_query(
+        "SELECT user_id, first_name, last_name, email, created_at, last_sign_in_at, "
+        "last_sign_in_ip, mobile_last_used_at, mobile_last_used_info, "
+        "web_sign_in_count, sign_in_count, highest_level_location "
+        "FROM " + USERS_TABLE + " WHERE LOWER(email) = LOWER(:email)",
+        {"email": customer_email},
+    )
+    if not users:
+        return None, None, None
+    user = users[0]
+
+    # Get primary location to resolve company_id
+    locs = run_query(
+        "SELECT location_id, company_id, name, created_at, archived_at, "
+        "active_now, tier_id, billing_source, mau "
+        "FROM " + LOCATIONS_TABLE + " WHERE owner_id = :uid "
+        "ORDER BY created_at ASC",
+        {"uid": user["user_id"]},
+    )
+    if not locs and user.get("highest_level_location"):
+        locs = run_query(
+            "SELECT location_id, company_id, name, created_at, archived_at, "
+            "active_now, tier_id, billing_source, mau "
+            "FROM " + LOCATIONS_TABLE + " WHERE location_id = :lid",
+            {"lid": user["highest_level_location"]},
+        )
+    if not locs:
+        return user, None, []
+
+    primary_loc = locs[0]
+    company_id  = primary_loc["company_id"]
+
+    # Get ALL locations for this company (cap at 100 to avoid timeout on large accounts)
+    all_locs = run_query(
+        "SELECT location_id, company_id, name, created_at, archived_at, "
+        "active_now, tier_id, billing_source, mau "
+        "FROM " + LOCATIONS_TABLE + " WHERE company_id = :cid "
+        "ORDER BY archived_at ASC NULLS FIRST, created_at ASC "
+        "LIMIT 100",
+        {"cid": company_id},
+    )
+
+    return user, primary_loc, all_locs
+
 def get_plan_history(company_id):
     return run_query(
         "SELECT location_id, type, start_tier, end_tier, old_subscription_type, "
@@ -1713,33 +2089,25 @@ def _build_package_inner(dispute_id):
     # get_disputed_location_from_candidates scans all candidates and returns the invoice
     # whose location_id is in all_locs — ensuring both the location and invoice are correct.
     disputed_loc_resolved, invoices = get_disputed_location_from_candidates(invoice_candidates, all_locs)
-    _log("resolved disputed loc")
-    # invoices is now the matched invoice (or first candidate as fallback)
-    disputed_loc = disputed_loc_resolved or loc  # for PDF display only
+    _log("resolved disputed loc: " + str((disputed_loc_resolved or {}).get("location_id","none")))
+    disputed_loc = disputed_loc_resolved or loc
 
-    # Use the matched invoice's created date as the charge date reference
     invoice_created = invoices.get("created") if invoices else None
 
-    # For duplicate disputes, fetch all invoices from the same billing date
     same_day_invoices = []
     if (dispute.get("reason") or "").lower() == "duplicate" and invoice_created:
+        _log("fetching same-day invoices (duplicate dispute)")
         same_day_invoices = get_same_day_invoices(
             dispute.get("customer_id",""), customer_email, invoice_created
         )
+        _log("got same-day invoices: " + str(len(same_day_invoices)))
 
-    # Use invoice created date as the charge date (more accurate than dispute created_at)
     charge_date_ref = invoice_created or dispute.get("created_at")
+    _log("charge_date_ref: " + str(charge_date_ref))
 
-    # For verdict: use resolved location if available. If not resolved from invoice metadata,
-    # fall back to the inferred location (disputed_loc) ONLY when the archived_at is clearly
-    # outside the refund window — i.e. canceled more than 30 days before the charge OR more
-    # than 30 days after. We never infer REFUND_OWED (too high stakes) — only CANCELED_AFTER_PERIOD
-    # or NEVER_CANCELED. If the fallback location is archived within 30 days of the charge,
-    # we leave it as NEVER_CANCELED and flag it for manual review.
     if disputed_loc_resolved:
         disputed_loc_archived_at = disputed_loc_resolved.get("archived_at")
     else:
-        # Infer from fallback loc, but only use for CANCELED_AFTER_PERIOD (not REFUND_OWED)
         fallback_archived = disputed_loc.get("archived_at") if disputed_loc else None
         if fallback_archived and charge_date_ref:
             try:
@@ -1751,34 +2119,34 @@ def _build_package_inner(dispute_id):
                 arch_dt = datetime.strptime(arch_str[:10], "%Y-%m-%d").date()
                 ref_dt  = datetime.strptime(str(ref)[:10], "%Y-%m-%d").date()
                 days_diff = (arch_dt - ref_dt).days
-                # Only use if clearly outside 30-day window — never infer REFUND_OWED
                 disputed_loc_archived_at = fallback_archived if abs(days_diff) > 30 else None
             except (ValueError, TypeError):
                 disputed_loc_archived_at = None
         else:
             disputed_loc_archived_at = None
+    _log("disputed_loc_archived_at: " + str(disputed_loc_archived_at))
 
-    # Scope activity to the disputed location only — not the whole company.
-    # Company-wide activity on a 27-location account is misleading for a single-location dispute.
     disputed_loc_id_for_activity = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
     if disputed_loc_id_for_activity:
+        _log("fetching location activity for " + str(disputed_loc_id_for_activity))
         act_summary, active_dates, last_active = get_activity_for_location(
             disputed_loc_id_for_activity, period_start, period_end
         )
-        _log("got location activity")
+        _log("got location activity: " + str((act_summary or {}).get("total_active_days","?")))
     else:
         _log("no location ID — activity remains empty")
 
-    # Verdict is based solely on whether the account was actually canceled (archived_at).
-    # A downgrade to Tier 1 does NOT trigger a refund — the customer continued using the
-    # service at the paid tier through the billing period before choosing to downgrade.
-    # Only a true cancellation (archived_at set) within 30 days of the charge date triggers REFUND_OWED.
-    downgrade_within_window = False  # retained for UI/pkg metadata compatibility
+    _log("determining verdict")
+    downgrade_within_window = False
     downgrade_date = None
     verdict = determine_verdict(dispute.get("reason"), disputed_loc_archived_at,
                                 dispute.get("evidence_due_date"), charge_date_ref)
+    _log("verdict: " + str(verdict))
+    _log("evaluating signals")
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
+    _log("checking payroll")
     charge_is_payroll = is_payroll_invoice(invoices)
+    _log("charge_is_payroll: " + str(charge_is_payroll))
     slug = dispute_id.replace("_","-")
     _log("building PDF 1")
     pdf1 = pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals, company_name=company_name)
@@ -1796,21 +2164,18 @@ def _build_package_inner(dispute_id):
         slug + "_3_service_documentation.pdf":      pdf3,
         slug + "_4_refund_cancellation_policy.pdf": pdf4,
     }
+    _log("assembling pkg metadata")
     pkg["_signals"]               = signals
     pkg["_verdict"]               = verdict
     pkg["_charge_is_payroll"]     = charge_is_payroll
     pkg["_downgrade_within_window"] = downgrade_within_window
     pkg["_archived_at"]           = downgrade_date if downgrade_within_window else ((fmt(disputed_loc.get("archived_at")) if disputed_loc else None) or "--")
 
-    # Check if the disputed location needs action:
-    # Flag if it is NOT canceled OR still above Tier 1
     needs_downgrade = []
     dl = disputed_loc or loc
     if dl:
         not_canceled = not dl.get("archived_at")
         above_tier1  = str(dl.get("tier_id","1")) != "1"
-        # Only flag if BOTH not canceled AND above tier 1
-        # Tier 1 is free so no downgrade needed even if not canceled
         if not_canceled and above_tier1:
             needs_downgrade.append({
                 "location_id": dl.get("location_id"),
