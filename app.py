@@ -83,7 +83,23 @@ def get_conn():
         server_hostname=cfg.host,
         http_path=DATABRICKS_HTTP_PATH,
         credentials_provider=lambda: cfg.authenticate,
+        _socket_timeout=120,
+        connection_timeout=120,
     )
+
+def wake_warehouse():
+    """Run a trivial query at app startup to wake the warehouse before any user submits.
+    Runs in a background thread so it doesn't block the app from loading."""
+    import threading
+    def _ping():
+        try:
+            conn = get_conn()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.close()
+        except Exception:
+            pass  # Silently ignore — warehouse will wake on first real request
+    threading.Thread(target=_ping, daemon=True).start()
 
 def esc(val):
     if val is None:
@@ -2109,4 +2125,5 @@ def _download(n, store, idx):
 
 if __name__ == "__main__":
     port = int(os.environ.get("DATABRICKS_APP_PORT", 8050))
+    wake_warehouse()  # Ping warehouse in background so it's warm when first user submits
     app.run(debug=False, host="0.0.0.0", port=port)
