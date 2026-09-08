@@ -614,6 +614,9 @@ def detect_disputed_product(invoice_row):
                         "basic", "team app")
     PAYROLL_KEYWORDS = ("payroll",)
     HIRING_KEYWORDS  = ("hiring",)
+    # Line items that are billing artefacts, not Homebase products -- always ignored
+    SKIP_KEYWORDS    = ("tax", "vat", "gst", "hst", "pst", "sales tax", "service tax",
+                        "discount", "coupon", "proration", "rounding")
 
     try:
         lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
@@ -626,6 +629,8 @@ def detect_disputed_product(invoice_row):
             amount = item.get("amount", 0) or 0
             if amount == 0:
                 continue    # skip credits / $0 adjustments
+            if any(k in desc_l for k in SKIP_KEYWORDS):
+                continue    # skip tax lines and other billing artefacts
 
             if any(k in desc_l for k in PAYROLL_KEYWORDS):
                 found.append(("payroll", desc or "Payroll", amount))
