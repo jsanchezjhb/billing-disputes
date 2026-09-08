@@ -586,6 +586,72 @@ def is_payroll_invoice(invoices_row):
         pass
     return False
 
+def detect_disputed_product(invoice_row):
+    """
+    Inspect invoice line items to determine what Homebase product is being disputed.
+    Returns a dict:
+      - product_type  : "core" | "payroll" | "hiring" | "other" | "unknown"
+      - product_label : human-readable description taken from the line item
+      - is_core       : True only when the charge is for a core subscription tier
+                        (Essentials, Plus, All-in-One). False for payroll, hiring,
+                        or anything else — which means NO downgrade should be shown.
+
+    We default to is_core=True when we cannot parse line items, so existing behaviour
+    is preserved for invoices with missing/unparseable line data.
+    """
+    import json
+    _UNKNOWN = {"product_type": "unknown", "product_label": "Unknown", "is_core": True}
+
+    if not invoice_row:
+        return _UNKNOWN
+
+    lines_raw = invoice_row.get("lines")
+    if not lines_raw:
+        return _UNKNOWN
+
+    # Keywords for each bucket (all checked case-insensitively)
+    CORE_KEYWORDS    = ("essentials", "plus", "all-in-one", "all in one", "allinone",
+                        "basic", "team app")
+    PAYROLL_KEYWORDS = ("payroll",)
+    HIRING_KEYWORDS  = ("hiring",)
+
+    try:
+        lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
+        data  = lines.get("data", []) if isinstance(lines, dict) else []
+
+        found = []          # list of (product_type, label, amount)
+        for item in data:
+            desc   = (item.get("description") or "").strip()
+            desc_l = desc.lower()
+            amount = item.get("amount", 0) or 0
+            if amount == 0:
+                continue    # skip credits / $0 adjustments
+
+            if any(k in desc_l for k in PAYROLL_KEYWORDS):
+                found.append(("payroll", desc or "Payroll", amount))
+            elif any(k in desc_l for k in HIRING_KEYWORDS):
+                found.append(("hiring", desc or "Hiring Assistant", amount))
+            elif any(k in desc_l for k in CORE_KEYWORDS):
+                found.append(("core", desc or "Core Subscription", amount))
+            elif desc:
+                found.append(("other", desc, amount))
+
+        if not found:
+            return _UNKNOWN
+
+        # Non-core products take detection priority over core.
+        # If any line is payroll / hiring / other, that's what's being disputed.
+        for pt in ("payroll", "hiring", "other"):
+            for (t, label, _) in found:
+                if t == pt:
+                    return {"product_type": pt, "product_label": label, "is_core": False}
+
+        # Only core lines found
+        return {"product_type": "core", "product_label": found[0][1], "is_core": True}
+
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return _UNKNOWN
+
 def determine_verdict(reason, archived_at, evidence_due_date, dispute_created=None):
     r = (reason or "").lower()
     if r in ("fraudulent","debit_not_authorized","unrecognized",
@@ -1750,7 +1816,8 @@ def _build_package_inner(dispute_id):
     verdict = determine_verdict(dispute.get("reason"), disputed_loc_archived_at,
                                 dispute.get("evidence_due_date"), charge_date_ref)
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
-    charge_is_payroll = is_payroll_invoice(invoices)
+    charge_is_payroll   = is_payroll_invoice(invoices)
+    disputed_product    = detect_disputed_product(invoices)
     slug = dispute_id.replace("_","-")
     _log("building PDF 1")
     pdf1 = pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals, company_name=company_name)
@@ -1771,14 +1838,19 @@ def _build_package_inner(dispute_id):
     pkg["_signals"]               = signals
     pkg["_verdict"]               = verdict
     pkg["_charge_is_payroll"]     = charge_is_payroll
+    pkg["_disputed_product"]      = disputed_product
     pkg["_downgrade_within_window"] = downgrade_within_window
     pkg["_archived_at"]           = downgrade_date if downgrade_within_window else ((fmt(disputed_loc.get("archived_at")) if disputed_loc else None) or "--")
 
     # Check if the disputed location needs action:
-    # Flag if it is NOT canceled OR still above Tier 1
+    # Flag if it is NOT canceled AND still above Tier 1.
+    # IMPORTANT: Only show a downgrade alert when the dispute is for a core subscription
+    # product (Essentials / Plus / All-in-One). If the charge is for Payroll, Hiring, or
+    # any other non-core product we must NOT downgrade the account — the core sub is
+    # unrelated to this dispute.
     needs_downgrade = []
     dl = disputed_loc or loc
-    if dl:
+    if dl and disputed_product.get("is_core", True):
         not_canceled = not dl.get("archived_at")
         above_tier1  = str(dl.get("tier_id","1")) != "1"
         # Only flag if BOTH not canceled AND above tier 1
@@ -1942,6 +2014,7 @@ def on_generate(n_clicks, dispute_id):
         loc_resolved         = pdfs.get("_disputed_loc_resolved", False)
         dg_flag              = pdfs.get("_downgrade_within_window", False)
         charge_is_payroll    = pdfs.get("_charge_is_payroll", False)
+        disputed_product     = pdfs.get("_disputed_product", {"product_type": "unknown", "product_label": "", "is_core": True})
 
         admin_link = html.Div([
             html.Span("Admin: ", style={"fontSize":"12px","color":"#6b7280"}),
@@ -2058,8 +2131,17 @@ def on_generate(n_clicks, dispute_id):
                            "borderRadius":"8px","padding":"12px 14px","marginTop":"8px"}),
             ])
 
+        # ── Non-core product banners ───────────────────────────────────────────
+        # These fire when the disputed invoice is NOT a core subscription charge
+        # (Essentials / Plus / All-in-One).  In all of these cases the downgrade
+        # alert is intentionally suppressed — the core sub is unrelated.
+
+        prod_type  = disputed_product.get("product_type", "unknown")
+        prod_label = disputed_product.get("product_label", "")
+        is_core    = disputed_product.get("is_core", True)
+
         # Payroll charge callout — only fires when the disputed invoice is itself a payroll charge
-        if charge_is_payroll:
+        if charge_is_payroll or prod_type == "payroll":
             status = html.Div([
                 status,
                 html.Div([
@@ -2068,13 +2150,71 @@ def on_generate(n_clicks, dispute_id):
                                     "color": "#92400e", "marginBottom": "6px",
                                     "letterSpacing": "0.04em"}),
                     html.Div(
-                        "This dispute is for a Payroll charge. Payroll cannot be self-offboarded "
+                        "This dispute is for a Payroll charge"
+                        + ((" (" + prod_label + ")") if prod_label and prod_label.lower() not in ("payroll","") else "")
+                        + ". Payroll cannot be self-offboarded "
                         "— the customer must be called to walk through cancellation, final payroll "
                         "runs, tax filing obligations, and employee notifications before the "
                         "account is closed.",
                         style={"fontSize": "12px", "color": "#78350f", "marginBottom": "6px"}),
                     html.Div("Do not accept or file this dispute until the offboarding call is complete.",
                              style={"fontSize": "12px", "fontWeight": "700", "color": "#92400e"}),
+                    html.Div("⛔ Do NOT downgrade the core subscription — this charge is unrelated to the team app plan.",
+                             style={"fontSize": "12px", "fontWeight": "700", "color": "#92400e",
+                                    "marginTop": "6px", "borderTop": "1px solid #fcd34d",
+                                    "paddingTop": "6px"}),
+                ], style={"background": "#fffbeb", "border": "2px solid #fcd34d",
+                           "borderRadius": "8px", "padding": "12px 14px", "marginTop": "8px"}),
+            ])
+
+        # Hiring Assistant charge callout
+        elif prod_type == "hiring":
+            status = html.Div([
+                status,
+                html.Div([
+                    html.Div("⚠ HIRING ASSISTANT CHARGE — NOT A CORE SUBSCRIPTION DISPUTE",
+                             style={"fontWeight": "800", "fontSize": "13px",
+                                    "color": "#92400e", "marginBottom": "6px",
+                                    "letterSpacing": "0.04em"}),
+                    html.Div([
+                        html.Span("Disputed product: ", style={"fontWeight": "700"}),
+                        html.Span(prod_label or "Hiring Assistant",
+                                  style={"fontFamily": "monospace", "background": "#fef3c7",
+                                         "padding": "1px 5px", "borderRadius": "4px"}),
+                    ], style={"fontSize": "12px", "color": "#78350f", "marginBottom": "6px"}),
+                    html.Div(
+                        "This dispute is for a Hiring Assistant charge, not the core team app subscription. "
+                        "Review the hiring product billing and dispute history before responding.",
+                        style={"fontSize": "12px", "color": "#78350f", "marginBottom": "6px"}),
+                    html.Div("⛔ Do NOT downgrade the core subscription — this charge is unrelated to the team app plan.",
+                             style={"fontSize": "12px", "fontWeight": "700", "color": "#92400e",
+                                    "borderTop": "1px solid #fcd34d", "paddingTop": "6px"}),
+                ], style={"background": "#fffbeb", "border": "2px solid #fcd34d",
+                           "borderRadius": "8px", "padding": "12px 14px", "marginTop": "8px"}),
+            ])
+
+        # Any other non-core product (catch-all)
+        elif not is_core and prod_type not in ("core", "unknown"):
+            status = html.Div([
+                status,
+                html.Div([
+                    html.Div("⚠ NON-CORE PRODUCT DISPUTE — NO DOWNGRADE NEEDED",
+                             style={"fontWeight": "800", "fontSize": "13px",
+                                    "color": "#92400e", "marginBottom": "6px",
+                                    "letterSpacing": "0.04em"}),
+                    html.Div([
+                        html.Span("Disputed product: ", style={"fontWeight": "700"}),
+                        html.Span(prod_label or "Non-core charge",
+                                  style={"fontFamily": "monospace", "background": "#fef3c7",
+                                         "padding": "1px 5px", "borderRadius": "4px"}),
+                    ], style={"fontSize": "12px", "color": "#78350f", "marginBottom": "6px"}),
+                    html.Div(
+                        "This dispute is not for a core Homebase subscription (Essentials / Plus / All-in-One). "
+                        "Handle the dispute based on the specific product charged.",
+                        style={"fontSize": "12px", "color": "#78350f", "marginBottom": "6px"}),
+                    html.Div("⛔ Do NOT downgrade the core subscription — this charge is unrelated to the team app plan.",
+                             style={"fontSize": "12px", "fontWeight": "700", "color": "#92400e",
+                                    "borderTop": "1px solid #fcd34d", "paddingTop": "6px"}),
                 ], style={"background": "#fffbeb", "border": "2px solid #fcd34d",
                            "borderRadius": "8px", "padding": "12px 14px", "marginTop": "8px"}),
             ])
