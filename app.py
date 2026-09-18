@@ -419,9 +419,28 @@ def get_account(customer_email):
         "FROM " + USERS_TABLE + " WHERE LOWER(email) = LOWER(:email)",
         {"email": customer_email},
     )
+
+    fraud_closed = False
+    if not users:
+        # Fallback: when Homebase closes an account for fraud signals, the email in our
+        # users table is prefixed with "invalid_" (e.g. invalid_user@domain.com).
+        # Stripe still holds the original email, so the primary lookup above fails.
+        # Retry with the prefixed variant to detect this case.
+        users = run_query(
+            "SELECT user_id, first_name, last_name, email, created_at, last_sign_in_at, "
+            "last_sign_in_ip, mobile_last_used_at, mobile_last_used_info, "
+            "web_sign_in_count, sign_in_count, highest_level_location "
+            "FROM " + USERS_TABLE + " WHERE LOWER(email) = LOWER(:email)",
+            {"email": "invalid_" + customer_email},
+        )
+        if users:
+            fraud_closed = True
+
     if not users:
         return None, None, None
+
     user = users[0]
+    user["_fraud_closed"] = fraud_closed  # consumed downstream to override verdict and UI
 
     # Get primary location to resolve company_id
     locs = run_query(
@@ -1647,7 +1666,14 @@ def _build_package_inner(dispute_id):
         raise ValueError("Dispute record has no customer_email.")
     user, loc, all_locs = get_account(customer_email)
     _log("got account")
+    is_fraud_closed = bool(user and user.get("_fraud_closed"))
     if not loc:
+        if is_fraud_closed:
+            raise ValueError(
+                "FRAUD-CLOSED ACCOUNT — This account's email was invalidated by Homebase "
+                "(invalid_ prefix detected in users table). The dispute should be accepted "
+                "in Stripe. No location data is available to generate a package."
+            )
         raise ValueError("No Homebase account found for: " + customer_email)
     company_id    = loc["company_id"]
     plan_history  = get_plan_history(company_id)
@@ -1749,6 +1775,13 @@ def _build_package_inner(dispute_id):
     downgrade_date = None
     verdict = determine_verdict(dispute.get("reason"), disputed_loc_archived_at,
                                 dispute.get("evidence_due_date"), charge_date_ref)
+    # Fraud-closed accounts: Homebase initiated the closure (email invalidated).
+    # determine_verdict returns NEVER_CANCELED for fraud-reason disputes regardless
+    # of archived_at, but that's wrong here — this is a merchant-initiated closure,
+    # same class as any other admin closure. Override to REFUND_OWED unconditionally
+    # so the operator is always prompted to accept, not contest.
+    if is_fraud_closed:
+        verdict = "REFUND_OWED"
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
     charge_is_payroll = is_payroll_invoice(invoices)
     slug = dispute_id.replace("_","-")
@@ -1775,10 +1808,12 @@ def _build_package_inner(dispute_id):
     pkg["_archived_at"]           = downgrade_date if downgrade_within_window else ((fmt(disputed_loc.get("archived_at")) if disputed_loc else None) or "--")
 
     # Check if the disputed location needs action:
-    # Flag if it is NOT canceled OR still above Tier 1
+    # Flag if it is NOT canceled OR still above Tier 1.
+    # Skip entirely for fraud-closed accounts — Homebase already owns the closure;
+    # surfacing a downgrade alert alongside a "accept in Stripe" verdict is contradictory.
     needs_downgrade = []
     dl = disputed_loc or loc
-    if dl:
+    if dl and not is_fraud_closed:
         not_canceled = not dl.get("archived_at")
         above_tier1  = str(dl.get("tier_id","1")) != "1"
         # Only flag if BOTH not canceled AND above tier 1
@@ -1793,6 +1828,7 @@ def _build_package_inner(dispute_id):
                 "above_tier1":  above_tier1,
             })
     pkg["_needs_downgrade"] = needs_downgrade
+    pkg["_fraud_closed"]    = is_fraud_closed
     pkg["_company_id"]            = loc.get("company_id") if loc else None
     pkg["_company_name"]          = company_name
     pkg["_disputed_location_id"]  = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
@@ -1942,6 +1978,7 @@ def on_generate(n_clicks, dispute_id):
         loc_resolved         = pdfs.get("_disputed_loc_resolved", False)
         dg_flag              = pdfs.get("_downgrade_within_window", False)
         charge_is_payroll    = pdfs.get("_charge_is_payroll", False)
+        is_fraud_closed      = pdfs.get("_fraud_closed", False)
 
         admin_link = html.Div([
             html.Span("Admin: ", style={"fontSize":"12px","color":"#6b7280"}),
@@ -1974,21 +2011,40 @@ def on_generate(n_clicks, dispute_id):
         # Check if we should concede
         if verdict == "REFUND_OWED":
             archived = pdfs.get("_archived_at","--")
-            status = html.Div([
-                html.Div("⚠ ACCEPT THIS DISPUTE",
-                         style={"fontWeight":"800","fontSize":"16px","color":"#991b1b","marginBottom":"8px"}),
-                html.Div(
-                    "This account was canceled within the 30-day refund window.",
-                    style={"fontSize":"13px","color":"#991b1b","marginBottom":"4px"}),
-                html.Div(
-                    "Cancellation date: " + str(archived),
-                    style={"fontSize":"13px","color":"#7f1d1d","marginBottom":"4px"}),
-                html.Div("Action required: Issue a full refund and accept the dispute in Stripe.",
-                         style={"fontSize":"13px","fontWeight":"600","color":"#7f1d1d"}),
-            admin_link,
-            location_link,
-            ], style={"background":"#fef2f2","border":"2px solid #f87171",
-                      "borderRadius":"8px","padding":"16px","marginBottom":"12px"})
+            if is_fraud_closed:
+                status = html.Div([
+                    html.Div("⛔ FRAUD-CLOSED ACCOUNT — ACCEPT THIS DISPUTE",
+                             style={"fontWeight":"800","fontSize":"16px","color":"#991b1b","marginBottom":"8px"}),
+                    html.Div(
+                        "Homebase closed this account for fraud signals. The email in our system "
+                        "was invalidated (invalid_ prefix) and no longer matches what Stripe has on file.",
+                        style={"fontSize":"13px","color":"#991b1b","marginBottom":"6px"}),
+                    html.Div(
+                        "Merchant-initiated closures are covered by the 30-day refund policy. "
+                        "Contesting this dispute is not appropriate.",
+                        style={"fontSize":"13px","color":"#7f1d1d","marginBottom":"6px"}),
+                    html.Div("Action required: Accept the dispute in Stripe — do not file evidence.",
+                             style={"fontSize":"13px","fontWeight":"700","color":"#7f1d1d"}),
+                    admin_link,
+                    location_link,
+                ], style={"background":"#fef2f2","border":"2px solid #f87171",
+                          "borderRadius":"8px","padding":"16px","marginBottom":"12px"})
+            else:
+                status = html.Div([
+                    html.Div("⚠ ACCEPT THIS DISPUTE",
+                             style={"fontWeight":"800","fontSize":"16px","color":"#991b1b","marginBottom":"8px"}),
+                    html.Div(
+                        "This account was canceled within the 30-day refund window.",
+                        style={"fontSize":"13px","color":"#991b1b","marginBottom":"4px"}),
+                    html.Div(
+                        "Cancellation date: " + str(archived),
+                        style={"fontSize":"13px","color":"#7f1d1d","marginBottom":"4px"}),
+                    html.Div("Action required: Issue a full refund and accept the dispute in Stripe.",
+                             style={"fontSize":"13px","fontWeight":"600","color":"#7f1d1d"}),
+                    admin_link,
+                    location_link,
+                ], style={"background":"#fef2f2","border":"2px solid #f87171",
+                          "borderRadius":"8px","padding":"16px","marginBottom":"12px"})
         else:
             sig_bg  = "#f0fdf4" if strength == "strong" else ("#fffbeb" if strength == "moderate" else "#fef2f2")
             sig_bdr = "#a7f3d0" if strength == "strong" else ("#fcd34d" if strength == "moderate" else "#fecaca")
@@ -2022,12 +2078,9 @@ def on_generate(n_clicks, dispute_id):
             ], style={"background":sig_bg,"border":"1px solid " + sig_bdr,
                       "borderRadius":"8px","padding":"12px 14px","marginBottom":"12px"})
 
-        # Downgrade alerts — suppressed for payroll disputes.
-        # Payroll accounts require a full offboarding call before any account action;
-        # showing a downgrade prompt alongside the payroll callout sends contradictory
-        # instructions and could cause a rep to act before the call is complete.
+        # Downgrade alerts
         needs_downgrade = pdfs.get("_needs_downgrade", [])
-        if needs_downgrade and not charge_is_payroll:
+        if needs_downgrade:
             dg_items = []
             for nd in needs_downgrade:
                 company_id  = nd.get("company_id") or pdfs.get("_company_id","")
