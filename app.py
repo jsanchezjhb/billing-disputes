@@ -605,11 +605,60 @@ def is_payroll_invoice(invoices_row):
         pass
     return False
 
+def detect_disputed_product(invoice_row):
+    """
+    Classify what the disputed invoice actually billed so core-subscription logic
+    (downgrade alerts) only runs for core products.
+    Returns {"product_type": core|payroll|hiring|other|unknown, "product_label": str, "is_core": bool}.
+    Billing artefacts (tax, discounts, proration, rounding) and zero/negative lines are ignored.
+    NOTE: "credit" is deliberately NOT a skip keyword -- it would swallow products like "SMS Credits".
+    """
+    import json, re
+    _UNKNOWN = {"product_type": "unknown", "product_label": "Unknown", "is_core": True}
+    if not invoice_row:
+        return _UNKNOWN
+    lines_raw = invoice_row.get("lines")
+    if not lines_raw:
+        return _UNKNOWN
+    CORE_KEYWORDS    = ("essentials", "plus", "all-in-one", "all in one", "allinone", "basic", "team app")
+    PAYROLL_KEYWORDS = ("payroll",)
+    HIRING_KEYWORDS  = ("hiring",)
+    SKIP_RE = re.compile(r"\b(tax|vat|gst|hst|pst|sales tax|service tax|discount|coupon|proration|rounding)\b")
+    try:
+        lines = json.loads(lines_raw) if isinstance(lines_raw, str) else lines_raw
+        data  = lines.get("data", []) if isinstance(lines, dict) else []
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return _UNKNOWN
+    found = []
+    for item in data:
+        desc   = (item.get("description") or "").strip()
+        desc_l = desc.lower()
+        amount = item.get("amount", 0) or 0
+        if amount <= 0:
+            continue
+        if SKIP_RE.search(desc_l):
+            continue
+        if any(k in desc_l for k in PAYROLL_KEYWORDS):
+            found.append(("payroll", desc or "Payroll"))
+        elif any(k in desc_l for k in HIRING_KEYWORDS):
+            found.append(("hiring", desc or "Hiring Assistant"))
+        elif any(k in desc_l for k in CORE_KEYWORDS):
+            found.append(("core", desc))
+        elif desc:
+            found.append(("other", desc))
+    if not found:
+        return _UNKNOWN
+    # Any non-core product on the invoice wins over core lines (priority order).
+    for ptype in ("payroll", "hiring", "other", "core"):
+        for t, label in found:
+            if t == ptype:
+                return {"product_type": ptype, "product_label": label, "is_core": ptype == "core"}
+    return _UNKNOWN
+
 def determine_verdict(reason, archived_at, evidence_due_date, dispute_created=None):
-    r = (reason or "").lower()
-    if r in ("fraudulent","debit_not_authorized","unrecognized",
-             "bank_cannot_process","insufficient_funds","incorrect_account_details"):
-        return "NEVER_CANCELED"
+    # No reason-based early return: cancellation timing (archived_at vs charge date)
+    # decides the verdict for EVERY dispute reason, so a location canceled inside the
+    # 30-day window is REFUND_OWED even when the chargeback is coded "fraudulent".
     if not archived_at:
         return "NEVER_CANCELED"
     arch = fmt(archived_at)
@@ -804,6 +853,28 @@ def get_reason_content(reason, name, email, company, amount, created,
             return "\"" + loc_name + "\" (" + co_name + " account)"
         return "\"" + loc_name + "\""
 
+    # Location status wording comes from the real archived_at -- never hardcoded.
+    if loc_archived:
+        status_clause = ("was canceled on " + loc_archived + ", after the 30-day refund "
+                         "window for this charge had closed")
+        no_cancel_clause = ("The cancellation occurred after the 30-day refund window had closed, "
+                            "and the service was actively rendered. ")
+    else:
+        status_clause = "remains fully active (archived_at = NULL, active_now = TRUE)"
+        no_cancel_clause = "No cancellation was initiated and the service was actively rendered. "
+
+    # Canceled inside the refund window: accept, whatever the chargeback reason code is.
+    if verdict == "REFUND_OWED" and r != "subscription_canceled":
+        return [
+            "After reviewing this dispute, our records show that the location "
+            + loc_ref() + " was canceled on " + (loc_archived or "the date recorded in our system")
+            + ", within the 30-day refund window for the disputed charge of " + str(amount or "--") + ". "
+            "Under Homebase's refund policy, a location canceled within 30 days of a charge is "
+            "entitled to a full refund of that charge, including when the closure was initiated by Homebase.",
+            "This dispute should be accepted rather than contested. We are issuing a full refund "
+            "of " + str(amount or "--") + " to the customer.",
+        ]
+
     if r == "subscription_canceled":
         if verdict == "REFUND_OWED":
             return [
@@ -864,8 +935,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             "including " + str(w_act) + " web sessions and " + str(m_act) + " mobile sessions. "
             + ("The most recent recorded activity was " + last_active + ". " if last_active != "--" else "")
             + "This level of engagement is inconsistent with a fraudulent or unauthorized account.",
-            "The account remains fully active (archived_at = NULL, active_now = TRUE) and "
-            "has never been flagged or reported as compromised. The charge of " + amount + " was "
+            "The location " + status_clause + ". The charge of " + amount + " was "
             "a legitimate recurring subscription billing and was fully authorized.",
         ]
     elif r == "duplicate":
@@ -943,8 +1013,7 @@ def get_reason_content(reason, name, email, company, amount, created,
             "individual charge. The customer did not submit a refund request within 30 days "
             "of this charge, and no cancellation was initiated within that window. No credit "
             "or refund was therefore authorized.",
-            "The account " + loc_ref() + " remains fully active (archived_at = NULL, "
-            "active_now = TRUE) and was used on " + str(t_act) + " days during the disputed period. "
+            "The account " + loc_ref() + " " + status_clause + " and was used on " + str(t_act) + " days during the disputed period. "
             "The service was actively rendered and no credit is owed.",
             "The charge of " + amount + " stands as a valid subscription billing.",
         ]
@@ -1033,10 +1102,10 @@ def get_reason_content(reason, name, email, company, amount, created,
         return [
             "We are disputing the chargeback filed by " + name + " (" + email + ") for " + amount + ". "
             "Our records demonstrate this was a legitimate charge for an active Homebase subscription.",
-            "The account " + loc_ref() + " was created on " + created + " and remains fully active "
-            "(archived_at = NULL, active_now = TRUE). The customer has " + str(signins) + " total "
+            "The account " + loc_ref() + " was created on " + created + " and " + status_clause + ". "
+            "The customer has " + str(signins) + " total "
             "sign-ins and was active on " + str(t_act) + " days during the disputed period.",
-            "No cancellation was initiated and the service was actively rendered. "
+            no_cancel_clause +
             "The charge of " + amount + " is fully valid.",
         ]
 
@@ -1133,7 +1202,11 @@ def pdf_narrative(dispute, user, loc, verdict, act_summary, active_dates, last_a
     else:
         s.append(bp("No activity records found for this account."))
     s.append(Spacer(1, 14))
-    if r == "fraudulent":
+    if verdict == "REFUND_OWED":
+        act_tip = ("Do NOT submit this package: the location was canceled within the 30-day "
+                   "refund window. Issue the refund and accept the dispute in Stripe. Activity "
+                   "history does not change the refund obligation.")
+    elif r == "fraudulent":
         act_tip = ("Key evidence: The sustained login history and platform usage is inconsistent "
                    "with an unauthorized account. A fraudster would not maintain this level of engagement.")
     elif r == "product_not_received":
@@ -1432,7 +1505,13 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None, disputed_l
     # Dynamically summarize plan history
     has_downgrades = any(e.get("type") == "downgrade" for e in plan_history)
     has_cancels    = any("cancel" in str(e.get("type") or "").lower() for e in plan_history)
-    if not has_downgrades and not has_cancels:
+    if dl_archived_tip:
+        plan_tip = ("Note: The disputed location was canceled (archived_at = " + fmt(dl_archived_tip) + "). "
+                    "Cancellations and Homebase-initiated closures set archived_at on the location record "
+                    "without necessarily creating an event in this plan-change history, so the absence of "
+                    "a cancel event above does not mean the location is active.")
+        tip_col = RED
+    elif not has_downgrades and not has_cancels:
         plan_tip = ("Key evidence: No downgrade or cancellation events appear in the subscription "
                     "history. The account has been continuously active since creation.")
         tip_col = GREEN
@@ -1445,8 +1524,8 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None, disputed_l
         plan_tip = ("Note: The subscription history contains changes. Review the table above "
                     "to confirm the account status at the time of the disputed charge.")
         tip_col  = AMBER
-    tip_bg  = GREEN_LT if tip_col == GREEN else AMBER_LT
-    tip_bdr = GREEN_BDR if tip_col == GREEN else AMBER_BDR
+    tip_bg  = GREEN_LT if tip_col == GREEN else (RED_LT if tip_col == RED else AMBER_LT)
+    tip_bdr = GREEN_BDR if tip_col == GREEN else (RED_BDR if tip_col == RED else AMBER_BDR)
     s.append(tip_box(plan_tip, tip_bg, tip_bdr, tip_col))
     add_footer(s)
     doc.build(s)
@@ -1783,7 +1862,8 @@ def _build_package_inner(dispute_id):
     if is_fraud_closed:
         verdict = "REFUND_OWED"
     signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
-    charge_is_payroll = is_payroll_invoice(invoices)
+    product = detect_disputed_product(invoices)
+    charge_is_payroll = is_payroll_invoice(invoices) or product["product_type"] == "payroll"
     slug = dispute_id.replace("_","-")
     _log("building PDF 1")
     pdf1 = pdf_narrative(dispute, user, disputed_loc, verdict, act_summary, active_dates, last_active, all_locations, charge_history, signals, company_name=company_name)
@@ -1813,7 +1893,7 @@ def _build_package_inner(dispute_id):
     # surfacing a downgrade alert alongside a "accept in Stripe" verdict is contradictory.
     needs_downgrade = []
     dl = disputed_loc or loc
-    if dl and not is_fraud_closed:
+    if dl and not is_fraud_closed and product["is_core"] and not charge_is_payroll:
         not_canceled = not dl.get("archived_at")
         above_tier1  = str(dl.get("tier_id","1")) != "1"
         # Only flag if BOTH not canceled AND above tier 1
@@ -1829,6 +1909,7 @@ def _build_package_inner(dispute_id):
             })
     pkg["_needs_downgrade"] = needs_downgrade
     pkg["_fraud_closed"]    = is_fraud_closed
+    pkg["_product"]         = product
     pkg["_company_id"]            = loc.get("company_id") if loc else None
     pkg["_company_name"]          = company_name
     pkg["_disputed_location_id"]  = (disputed_loc_resolved or disputed_loc or {}).get("location_id")
@@ -2034,12 +2115,17 @@ def on_generate(n_clicks, dispute_id):
                     html.Div("⚠ ACCEPT THIS DISPUTE",
                              style={"fontWeight":"800","fontSize":"16px","color":"#991b1b","marginBottom":"8px"}),
                     html.Div(
-                        "This account was canceled within the 30-day refund window.",
+                        "This location was canceled within the 30-day refund window.",
                         style={"fontSize":"13px","color":"#991b1b","marginBottom":"4px"}),
+                    html.Div(
+                        "Homebase's refund policy entitles the customer to a full refund when a location "
+                        "is canceled within 30 days of a charge -- including closures initiated by Homebase "
+                        "(e.g. fraud-related shutdowns). Contesting this dispute is not appropriate.",
+                        style={"fontSize":"12px","color":"#7f1d1d","marginBottom":"6px"}),
                     html.Div(
                         "Cancellation date: " + str(archived),
                         style={"fontSize":"13px","color":"#7f1d1d","marginBottom":"4px"}),
-                    html.Div("Action required: Issue a full refund and accept the dispute in Stripe.",
+                    html.Div("Action required: Issue a full refund and accept the dispute in Stripe -- do not file evidence.",
                              style={"fontSize":"13px","fontWeight":"600","color":"#7f1d1d"}),
                     admin_link,
                     location_link,
@@ -2134,6 +2220,28 @@ def on_generate(n_clicks, dispute_id):
                         style={"fontSize": "12px", "color": "#78350f", "marginBottom": "6px"}),
                     html.Div("Do not accept or file this dispute until the offboarding call is complete.",
                              style={"fontSize": "12px", "fontWeight": "700", "color": "#92400e"}),
+                ], style={"background": "#fffbeb", "border": "2px solid #fcd34d",
+                           "borderRadius": "8px", "padding": "12px 14px", "marginTop": "8px"}),
+            ])
+
+        # Non-core product callout (hiring / other add-ons): downgrade logic does not apply.
+        _prod = pdfs.get("_product") or {}
+        if _prod.get("product_type") in ("hiring", "other"):
+            _is_hiring = _prod.get("product_type") == "hiring"
+            status = html.Div([
+                status,
+                html.Div([
+                    html.Div("⚠ " + ("HIRING ASSISTANT CHARGE" if _is_hiring else "NON-CORE PRODUCT CHARGE")
+                             + " -- " + str(_prod.get("product_label") or ""),
+                             style={"fontWeight": "800", "fontSize": "13px",
+                                    "color": "#92400e", "marginBottom": "6px",
+                                    "letterSpacing": "0.04em"}),
+                    html.Div(
+                        "This dispute is for a product other than a core Homebase subscription "
+                        "(Essentials, Plus, All-in-One). The location downgrade alert does not apply. "
+                        "Verify cancellation and refund eligibility for this specific product before "
+                        "accepting or filing.",
+                        style={"fontSize": "12px", "color": "#78350f"}),
                 ], style={"background": "#fffbeb", "border": "2px solid #fcd34d",
                            "borderRadius": "8px", "padding": "12px 14px", "marginTop": "8px"}),
             ])
