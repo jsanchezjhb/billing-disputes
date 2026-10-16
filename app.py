@@ -2078,9 +2078,12 @@ def on_generate(n_clicks, dispute_id):
             ], style={"background":sig_bg,"border":"1px solid " + sig_bdr,
                       "borderRadius":"8px","padding":"12px 14px","marginBottom":"12px"})
 
-        # Downgrade alerts
+        # Downgrade alerts — suppressed for payroll disputes.
+        # Payroll accounts require a full offboarding call before any account action;
+        # showing a downgrade prompt alongside the payroll callout sends contradictory
+        # instructions and could cause a rep to act before the call is complete.
         needs_downgrade = pdfs.get("_needs_downgrade", [])
-        if needs_downgrade:
+        if needs_downgrade and not charge_is_payroll:
             dg_items = []
             for nd in needs_downgrade:
                 company_id  = nd.get("company_id") or pdfs.get("_company_id","")
