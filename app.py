@@ -1,5 +1,7 @@
 import io
 import os
+import re
+import json
 import dash
 from dash import dcc, html, Input, Output, State, callback_context
 from databricks import sql as databricks_sql
@@ -9,7 +11,7 @@ from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import inch
 from reportlab.lib import colors
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, HRFlowable, KeepTogether
 )
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 
@@ -32,6 +34,9 @@ ACTIVITY_TABLE  = "prod_redshift_replica.public.fact_locations_by_day"
 INVOICE_TABLE   = "prod_redshift_replica.stripe.invoice"
 PAYROLL_TABLE   = "prod_redshift_replica.public.payroll_setup_infos"
 COMPANIES_TABLE = "prod_redshift_replica.public.companies"
+CHARGE_TABLE          = "prod_redshift_replica.stripe.charge"
+CHARGE_DISPUTE_TABLE  = "prod_redshift_replica.stripe.charge_dispute"
+CUSTOMER_TABLE        = "prod_redshift_replica.stripe.customer"
 
 # ── Colors ────────────────────────────────────────────────────────────────────
 DARK       = colors.HexColor("#0f172a")
@@ -139,7 +144,7 @@ def get_dispute(dispute_id):
     rows = run_query(
         "SELECT dispute_id, amount, status, reason, customer_name, customer_id, "
         "customer_email, created_at, last_updated_at, evidence_due_date, charge_id "
-        "FROM " + DISPUTES_TABLE + " WHERE dispute_id = :did",
+        "FROM " + DISPUTES_TABLE + " WHERE dispute_id = :did ORDER BY last_updated_at DESC LIMIT 1",
         {"did": dispute_id},
     )
     if not rows:
@@ -336,12 +341,16 @@ def get_disputed_location_from_candidates(invoice_candidates, all_locs):
 
     return None, invoice_candidates[0]
 
-def get_charge_history(customer_id, customer_email, limit=12):
-    """Fetch prior successful charges — scoped to last 24 months to avoid full table scan."""
+def get_charge_history(customer_id, customer_email, limit=12, before_ts=None, after_ts=None, exclude_charge=None):
+    """Prior successful invoices for the customer.
+    before_ts / after_ts (unix seconds) bound the window; the disputed charge itself is excluded.
+    The invoice table keeps snapshot rows, so results are de-duplicated by charge."""
     lim = int(limit)
     from datetime import datetime, timezone, timedelta
-    cutoff = int((datetime.now(timezone.utc) - timedelta(days=730)).timestamp())
+    cutoff = int(after_ts) if after_ts else int((datetime.now(timezone.utc) - timedelta(days=730)).timestamp())
     date_filter = " AND created > '" + str(cutoff) + "'"
+    if before_ts:
+        date_filter += " AND CAST(created AS BIGINT) < " + str(int(before_ts))
     rows = run_query(
         "SELECT number, amount_paid, period_start, period_end, "
         "created, status, billing_reason, charge "
@@ -362,7 +371,14 @@ def get_charge_history(customer_id, customer_email, limit=12):
             " ORDER BY created DESC LIMIT " + str(lim),
             {"email": customer_email},
         )
-    return rows or []
+    seen, out = set(), []
+    for r in rows or []:
+        key = r.get("charge") or r.get("number")
+        if key in seen or (exclude_charge and r.get("charge") == exclude_charge):
+            continue
+        seen.add(key)
+        out.append(r)
+    return out
 
 def get_same_day_invoices(customer_id, customer_email, charge_date_unix):
     """
@@ -411,9 +427,288 @@ def get_same_day_invoices(customer_id, customer_email, charge_date_unix):
     return rows or []
 
 
+# -- Identity evidence: prior undisputed transactions --------------------------------
+_CHARGE_ID_RE = re.compile(r"^(ch|py)_[A-Za-z0-9]+$")
+WINDOW_MIN_DAYS, WINDOW_MAX_DAYS = 120, 364   # card-network window for prior transactions
+
+def _to_unix(v):
+    if v is None or v == "":
+        return None
+    s = str(v).strip()
+    if s.lstrip("-").isdigit():
+        return int(s)
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.strptime(s[:19].replace("T", " "), "%Y-%m-%d %H:%M:%S")
+        return int(dt.replace(tzinfo=timezone.utc).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+def _unix_date(v):
+    ts = _to_unix(v)
+    if ts is None:
+        return "--"
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+def _jload(v):
+    if isinstance(v, dict):
+        return v
+    try:
+        data = json.loads(v) if v else {}
+        return data if isinstance(data, dict) else {}
+    except (TypeError, ValueError):
+        return {}
+
+def _truthy(v):
+    return str(v).strip().lower() == "true"
+
+def _norm_phone(p):
+    d = re.sub(r"\D", "", str(p or ""))
+    return d[-10:] if len(d) >= 10 else d
+
+def _norm_email(e):
+    e = str(e or "").strip().lower()
+    return e[len("invalid_"):] if e.startswith("invalid_") else e
+
+def _norm_name(n):
+    return re.sub(r"\s+", " ", str(n or "").strip().lower())
+
+def _public_ip(ip):
+    """Return the IP only if it is a real public address (drops 127.0.0.1, private ranges, etc.)."""
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(str(ip).strip())
+    except ValueError:
+        return None
+    if a.is_private or a.is_loopback or a.is_unspecified or a.is_link_local or a.is_reserved:
+        return None
+    return str(a)
+
+def _id_list(ids):
+    return ",".join(esc(i) for i in ids)
+
+def _valid_charge_ids(ids):
+    return [c for c in dict.fromkeys(ids) if c and _CHARGE_ID_RE.match(str(c))]
+
+def get_charge_rows(charge_ids):
+    """Latest snapshot row per charge. The charge table keeps one row per change."""
+    ids = _valid_charge_ids(charge_ids)
+    if not ids:
+        return {}
+    rows = run_query(
+        "WITH latest AS (SELECT id, customer, invoice, created, amount, refunded, amount_refunded, "
+        "disputed, billing_details, payment_method_details, receipt_email, "
+        "ROW_NUMBER() OVER (PARTITION BY id ORDER BY row_effective_from DESC) AS rn "
+        "FROM " + CHARGE_TABLE + " WHERE id IN (" + _id_list(ids) + ")) "
+        "SELECT * FROM latest WHERE rn = 1"
+    )
+    return {r["id"]: r for r in rows}
+
+def get_disputed_charge_ids(charge_ids):
+    """Charges that have a dispute record. charge.disputed is not reliable on its own: in testing,
+    charges with a dispute record still showed disputed = false, so charge_dispute is authoritative."""
+    ids = _valid_charge_ids(charge_ids)
+    if not ids:
+        return set()
+    rows = run_query("SELECT DISTINCT charge FROM " + CHARGE_DISPUTE_TABLE +
+                     " WHERE charge IN (" + _id_list(ids) + ")")
+    return {r["charge"] for r in rows}
+
+def get_stripe_customer(customer_id):
+    if not customer_id:
+        return {}
+    rows = run_query(
+        "SELECT id, email, phone FROM (SELECT id, email, phone, "
+        "ROW_NUMBER() OVER (PARTITION BY id ORDER BY row_effective_from DESC) AS rn "
+        "FROM " + CUSTOMER_TABLE + " WHERE id = :cid) t WHERE rn = 1",
+        {"cid": customer_id},
+    )
+    return rows[0] if rows else {}
+
+def _charge_ident(row, cust):
+    bd = _jload(row.get("billing_details"))
+    pm = _jload(row.get("payment_method_details"))
+    card = pm.get(pm.get("type") or "card") or pm.get("card") or {}
+    charge_email = bd.get("email") or row.get("receipt_email")
+    addr = bd.get("address") if isinstance(bd.get("address"), dict) else {}
+    return {
+        "charge_id": row.get("id"),
+        "created":   row.get("created"),
+        "amount":    row.get("amount"),
+        "email":     _norm_email(charge_email or cust.get("email")),
+        "name":      bd.get("name") or "",
+        "postal":    addr.get("postal_code") or "",
+        "phone":     bd.get("phone") or "",
+        "fp":        card.get("fingerprint") or "",
+        "last4":     card.get("last4") or "",
+        "brand":     card.get("brand") or card.get("bank_name") or "",
+    }
+
+def _match_summary(priors, account):
+    """Which identifiers are shared by the disputed charge and the given prior charges.
+    A transaction-level identifier must match on at least two of them (or the only one, if just one)."""
+    n = len(priors)
+    need = min(2, n)
+    bank, support = [], []
+    if n >= 1:
+        if sum(p["m_email"] for p in priors) >= need:
+            bank.append("Email")
+        if account.get("user_id"):
+            bank.append("Login ID")
+        if account.get("phone_match"):
+            bank.append("Telephone")
+        if sum(p["m_card"] for p in priors) >= need:
+            support.append("Payment method")
+        if sum(p["m_name"] for p in priors) >= need:
+            support.append("Billing name")
+        if sum(p["m_zip"] for p in priors) >= need:
+            support.append("Billing ZIP")
+    return bank, support
+
+def drop_disputed_charges(history):
+    """Remove invoices whose charge has a dispute record, so the narrative never presents a charge the
+    customer disputed as part of an established, authorized billing relationship."""
+    ids = [h.get("charge") for h in history if h.get("charge")]
+    flagged = get_disputed_charge_ids(ids) if ids else set()
+    return [h for h in history if h.get("charge") not in flagged]
+
+def build_identity_evidence(dispute, user, disputed_charge_id, candidate_invoices, disputed_ts):
+    """Compare the disputed charge with earlier charges on the same billing account that were paid,
+    never disputed (per the dispute table) and never refunded. Only identifiers that exist in our
+    data are compared. IP and device are NOT tied to transactions in our data, so they are reported
+    as account-level facts and are never counted as transaction matches."""
+    cust_id = dispute.get("customer_id")
+    cands = []
+    for inv in candidate_invoices or []:
+        c = inv.get("charge")
+        if c and c != disputed_charge_id and c not in cands:
+            cands.append(c)
+    cands = cands[:30]
+    if not disputed_charge_id:
+        return None
+    rows = get_charge_rows(cands + [disputed_charge_id])
+    d_row = rows.get(disputed_charge_id)
+    if not d_row:
+        return None
+    cust = get_stripe_customer(cust_id)
+    disputed = _charge_ident(d_row, cust)
+    flagged = get_disputed_charge_ids(cands)
+
+    priors, excluded = [], 0
+    for cid in cands:
+        r = rows.get(cid)
+        if not r:
+            continue
+        try:
+            refunded_amt = int(float(r.get("amount_refunded") or 0))
+        except (TypeError, ValueError):
+            refunded_amt = 0
+        if cid in flagged or _truthy(r.get("disputed")) or _truthy(r.get("refunded")) or refunded_amt > 0:
+            excluded += 1
+            continue
+        if cust_id and r.get("customer") and r.get("customer") != cust_id:
+            continue
+        ts = _to_unix(r.get("created"))
+        if disputed_ts and ts and ts >= disputed_ts:
+            continue
+        p = _charge_ident(r, cust)
+        days = int((disputed_ts - ts) / 86400) if (disputed_ts and ts) else None
+        p["days_before"] = days
+        p["in_window"] = days is not None and WINDOW_MIN_DAYS <= days <= WINDOW_MAX_DAYS
+        p["m_email"] = bool(p["email"] and p["email"] == disputed["email"])
+        p["m_card"]  = bool(p["fp"] and p["fp"] == disputed["fp"])
+        p["m_name"]  = bool(p["name"] and _norm_name(p["name"]) == _norm_name(disputed["name"]))
+        p["m_zip"]   = bool(p["postal"] and p["postal"] == disputed["postal"])
+        p["score"]   = sum([p["m_email"], p["m_card"], p["m_name"], p["m_zip"]])
+        priors.append(p)
+    priors.sort(key=lambda p: (not p["in_window"], -p["score"],
+                               p["days_before"] if p["days_before"] is not None else 10**9))
+    all_usable = len(priors)
+    priors = priors[:6]
+
+    u = user or {}
+    phone_u = _norm_phone(u.get("phone"))
+    phone_s = _norm_phone(disputed.get("phone") or cust.get("phone"))
+    account = {
+        "user_id":      u.get("user_id"),
+        "login_email":  u.get("email"),
+        "stripe_email": cust.get("email") or disputed.get("email"),
+        "stripe_customer": cust_id,
+        "phone_user":   bool(phone_u),
+        "phone_stripe": bool(phone_s),
+        "phone_match":  bool(phone_u and phone_s and phone_u == phone_s),
+        "ip":           _public_ip(u.get("last_sign_in_ip")),
+        "ip_at":        u.get("last_sign_in_at"),
+        "device":       u.get("mobile_last_used_info"),
+        "device_at":    u.get("mobile_last_used_at"),
+    }
+    bank, support = _match_summary(priors, account)
+    return {
+        "disputed": disputed, "priors": priors, "account": account,
+        "bank_matched": bank, "supporting_matched": support,
+        "usable_priors": all_usable, "excluded": excluded,
+        "in_window": sum(1 for p in priors if p["in_window"]),
+    }
+
+def identity_summary_text(ident):
+    """One-paragraph operator summary for the UI."""
+    if not ident:
+        return "Identifier match: unavailable (no charge-level data found for this dispute)."
+    parts = [
+        str(ident["usable_priors"]) + " usable prior undisputed charge(s)",
+        str(ident["in_window"]) + " in the " + str(WINDOW_MIN_DAYS) + "-" + str(WINDOW_MAX_DAYS) + " day window",
+    ]
+    if ident["excluded"]:
+        parts.append(str(ident["excluded"]) + " excluded because disputed or refunded")
+    names = ", ".join(ident["bank_matched"]) or "none"
+    txt = ("Prior transactions: " + "; ".join(parts) + ". Identifiers matched: " + names +
+           " (" + str(len(ident["bank_matched"])) + " of the 3 needed). ")
+    if ident["supporting_matched"]:
+        txt += "Also matched: " + ", ".join(ident["supporting_matched"]) + ". "
+    txt += "IP and device are not tied to transactions in our data."
+    return txt
+
+def get_consent_timeline(dispute, user, disputed_loc, plan_history, disputed_ts):
+    """Facts from our own data about how recurring billing began and continued."""
+    out = {"signup": fmt(user.get("created_at")) if user and user.get("created_at") else None,
+           "upgrade": None, "first_paid": None, "renewals": 0, "last_renewal": None}
+    loc_id = (disputed_loc or {}).get("location_id")
+    ups = [e for e in (plan_history or [])
+           if loc_id is not None and str(e.get("location_id")) == str(loc_id)
+           and "upgrade" in str(e.get("type") or "").lower()]
+    if ups:
+        ups.sort(key=lambda e: str(e.get("created_at")))
+        e = ups[0]
+        out["upgrade"] = {
+            "date": fmt(e.get("created_at")),
+            "tier": str(e.get("start_tier", "?")) + " to " + str(e.get("end_tier", "?")),
+            "plan": str(e.get("old_subscription_type") or "--") + " to " + str(e.get("new_subscription_type") or "--"),
+        }
+    cust_id = dispute.get("customer_id")
+    if cust_id and disputed_ts:
+        rows = run_query(
+            "SELECT MIN(CAST(created AS BIGINT)) AS first_paid, "
+            "COUNT(DISTINCT CASE WHEN billing_reason = 'subscription_cycle' THEN id END) AS renewals, "
+            "MAX(CASE WHEN billing_reason = 'subscription_cycle' THEN CAST(created AS BIGINT) END) AS last_renewal "
+            "FROM " + INVOICE_TABLE + " WHERE customer = :cid AND paid = 'true' "
+            "AND CAST(amount_paid AS DOUBLE) > 0 AND CAST(created AS BIGINT) < " + str(int(disputed_ts)),
+            {"cid": cust_id},
+        )
+        if rows:
+            r = rows[0]
+            out["first_paid"] = _unix_date(r.get("first_paid")) if r.get("first_paid") else None
+            try:
+                out["renewals"] = int(r.get("renewals") or 0)
+            except (TypeError, ValueError):
+                out["renewals"] = 0
+            out["last_renewal"] = _unix_date(r.get("last_renewal")) if r.get("last_renewal") else None
+    return out
+
+
 def get_account(customer_email):
     users = run_query(
-        "SELECT user_id, first_name, last_name, email, created_at, last_sign_in_at, "
+        "SELECT user_id, first_name, last_name, email, phone, created_at, last_sign_in_at, "
         "last_sign_in_ip, mobile_last_used_at, mobile_last_used_info, "
         "web_sign_in_count, sign_in_count, highest_level_location "
         "FROM " + USERS_TABLE + " WHERE LOWER(email) = LOWER(:email)",
@@ -427,7 +722,7 @@ def get_account(customer_email):
         # Stripe still holds the original email, so the primary lookup above fails.
         # Retry with the prefixed variant to detect this case.
         users = run_query(
-            "SELECT user_id, first_name, last_name, email, created_at, last_sign_in_at, "
+            "SELECT user_id, first_name, last_name, email, phone, created_at, last_sign_in_at, "
             "last_sign_in_ip, mobile_last_used_at, mobile_last_used_info, "
             "web_sign_in_count, sign_in_count, highest_level_location "
             "FROM " + USERS_TABLE + " WHERE LOWER(email) = LOWER(:email)",
@@ -440,6 +735,10 @@ def get_account(customer_email):
         return None, None, None
 
     user = users[0]
+    # The invalid_ prefix on the users-table email is the fraud-closure marker, even when the
+    # dispute record already carries the prefixed email and the first lookup succeeds.
+    if str(user.get("email") or "").lower().startswith("invalid_"):
+        fraud_closed = True
     user["_fraud_closed"] = fraud_closed  # consumed downstream to override verdict and UI
 
     # Get primary location to resolve company_id
@@ -780,7 +1079,98 @@ def add_footer(story):
         ParagraphStyle("ft", fontName="Helvetica", fontSize=8, textColor=MUTED, alignment=TA_CENTER)))
 
 # ── Case strength signals ────────────────────────────────────────────────────
-def evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history):
+def identity_section(s, ident, consent=None):
+    """Prior undisputed transactions + identifier match, and the billing timeline.
+    Renders only facts that exist in our data; omitted entirely when there is nothing to show."""
+    from xml.sax.saxutils import escape as _x
+    if ident and ident.get("priors"):
+        d, acct = ident["disputed"], ident["account"]
+        # Show the earlier charges that share something beyond the account itself; fall back to the top two.
+        pr = [p for p in ident["priors"] if p["score"] >= 2] or ident["priors"][:2]
+        pr = sorted(pr, key=lambda p: -(_to_unix(p.get("created")) or 0))  # newest first for reading
+        head = [Spacer(1, 16), HRFlowable(width="100%", thickness=1, color=GRAY_BDR), Spacer(1, 14),
+                sh("Prior Undisputed Transactions and Identifier Match"),
+                bp("The disputed charge is compared below with earlier charges on the same billing account. "
+                   "Each earlier charge was paid in full and has no dispute or refund on record."),
+                Spacer(1, 6)]
+        card = (str(d["brand"] or "").title() + " ending " + d["last4"]) if d.get("last4") else "--"
+        s.append(KeepTogether(head + [kv_table([
+            ("Disputed Charge",  _x(str(d.get("charge_id") or "--"))),
+            ("Charge Date",      _unix_date(d.get("created"))),
+            ("Email on File",    _x(d.get("email") or "--")),
+            ("Billing Name",     _x(d.get("name") or "--")),
+            ("Payment Method",   _x(card)),
+            ("Billing ZIP",      _x(d.get("postal") or "--")),
+        ])]))
+        s.append(Spacer(1, 10))
+
+        def cell(match, mine, theirs):
+            if not mine or not theirs:
+                return "--"
+            return "Match" if match else "No match"
+        rows = []
+        for p in pr:
+            rows.append([
+                _unix_date(p.get("created")),
+                _x(str(p.get("charge_id") or "--")),
+                fmt_amount(p.get("amount")),
+                str(p["days_before"]) if p.get("days_before") is not None else "--",
+                cell(p["m_email"], d.get("email"), p.get("email")),
+                cell(p["m_card"],  d.get("fp"),    p.get("fp")),
+                cell(p["m_name"],  d.get("name"),  p.get("name")),
+                cell(p["m_zip"],   d.get("postal"), p.get("postal")),
+            ])
+        s.append(grid_table(rows, ["Date", "Charge", "Amount", "Days Prior", "Email", "Pay Method", "Name", "ZIP"],
+                            cw=[0.95*inch, 1.6*inch, 0.65*inch, 0.6*inch, 0.7*inch, 0.8*inch, 0.8*inch, 0.9*inch]))
+        s.append(Spacer(1, 10))
+
+        acct_rows = []
+        if acct.get("user_id"):
+            acct_rows.append(("Homebase Login ID",
+                              "User ID " + _x(str(acct["user_id"])) + " (the same account is billed on every charge above)"))
+        if acct.get("login_email") and acct.get("stripe_email"):
+            same = _norm_email(acct["login_email"]) == _norm_email(acct["stripe_email"])
+            acct_rows.append(("Login Email vs Billing Email",
+                              _x(str(acct["stripe_email"])) + (" (match)" if same else " (differs)")))
+        if acct.get("phone_match"):
+            acct_rows.append(("Telephone", "Phone number on the Homebase account matches the billing record"))
+        elif acct.get("phone_user"):
+            acct_rows.append(("Telephone", "Phone number on file with Homebase"))
+        if acct.get("ip") and acct.get("ip_at"):
+            acct_rows.append(("Last Recorded Sign-In", fmt(acct["ip_at"]) + " from IP " + _x(str(acct["ip"]))))
+        if acct.get("device") and acct.get("device_at"):
+            acct_rows.append(("Last Recorded Mobile Device", _x(str(acct["device"])) + " (" + fmt(acct["device_at"]) + ")"))
+        if acct_rows:
+            s.append(kv_table(acct_rows))
+            s.append(Spacer(1, 4))
+            s.append(bp("Sign-in IP and device values are the most recent recorded on the account and are not "
+                        "tied to individual transactions.", MUTED))
+            s.append(Spacer(1, 6))
+        bank_s, support_s = _match_summary(pr, acct)
+        if bank_s:
+            txt = ("Identifiers shared by the disputed charge and the " + str(len(pr)) + " earlier undisputed charge(s) shown: " +
+                   ", ".join(bank_s) + ".")
+            if support_s:
+                txt += " Additional matches: " + ", ".join(support_s) + "."
+            s.append(tip_box(txt, GREEN_LT, GREEN_BDR, GREEN))
+
+    if consent and (consent.get("first_paid") or consent.get("upgrade")):
+        t_rows = []
+        if consent.get("signup"):
+            t_rows.append(("Account Created", consent["signup"]))
+        if consent.get("upgrade"):
+            up = consent["upgrade"]
+            t_rows.append(("Plan Upgrade Recorded", up["date"] + " (tier " + up["tier"] + "; " + _x(up["plan"]) + ")"))
+        if consent.get("first_paid"):
+            t_rows.append(("First Paid Charge", consent["first_paid"]))
+        if consent.get("renewals"):
+            t_rows.append(("Renewal Charges Paid Before This Charge",
+                           str(consent["renewals"]) + (" (most recent " + consent["last_renewal"] + ")" if consent.get("last_renewal") else "")))
+        if t_rows:
+            s.append(KeepTogether([Spacer(1, 16), sh("Billing Timeline"), kv_table(t_rows)]))
+
+
+def evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history, ident=None):
     from datetime import datetime
     signals = {
         "strength": "strong", "activity_level": "normal",
@@ -824,6 +1214,12 @@ def evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active,
     if signals["low_activity_flag"]:   signals["warnings"].append("low_activity")
     if signals["recency_gap_flag"]:    signals["warnings"].append("recency_gap_" + str(signals["recency_gap_days"]))
     if signals["visa_132_risk"]:       signals["warnings"].append("visa_132_risk")
+    # Identity evidence is reported alongside (not inside) the strength score.
+    if ident is not None:
+        signals["identity_count"]  = len(ident["bank_matched"])
+        signals["identity_priors"] = len(ident["priors"])
+        if len(ident["bank_matched"]) < 3 or len(ident["priors"]) < 2:
+            signals["warnings"].append("identity_thin_" + str(len(ident["bank_matched"])) + "_" + str(len(ident["priors"])))
     return signals
 
 
@@ -1371,7 +1767,7 @@ def pdf_receipt(dispute, invoices=None, same_day_invoices=None, active_loc_count
     buf.seek(0)
     return buf.read()
 
-def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None, disputed_loc=None):
+def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None, disputed_loc=None, ident=None, consent=None):
     buf = io.BytesIO()
     doc = make_doc(buf, "Service Documentation")
     s = []
@@ -1486,6 +1882,7 @@ def pdf_service_docs(dispute, user, loc, plan_history, all_locs=None, disputed_l
         s.append(kv_table(signin_rows))
     else:
         s.append(bp("No sign-in data available."))
+    identity_section(s, ident, consent)
     s.append(Spacer(1,18))
     s.append(HRFlowable(width="100%", thickness=1, color=GRAY_BDR))
     s.append(Spacer(1,18))
@@ -1779,9 +2176,7 @@ def _build_package_inner(dispute_id):
                                                 dispute.get("amount"), dispute.get("created_at"),
                                                 charge_id=dispute.get("charge_id"))
     _log("got invoice candidates: " + str(len(invoice_candidates)))
-    _log("fetching charge history")
-    charge_history = get_charge_history(dispute.get("customer_id",""), customer_email)
-    _log("got charge history")
+    charge_history = []  # fetched below, once the disputed invoice (and its charge date) is resolved
 
     # Resolve disputed location and correct invoice together from all candidates.
     # This is the critical step: when multiple invoices have the same amount on the same
@@ -1805,6 +2200,40 @@ def _build_package_inner(dispute_id):
 
     # Use invoice created date as the charge date (more accurate than dispute created_at)
     charge_date_ref = invoice_created or dispute.get("created_at")
+
+    # Prior undisputed transactions: bounded to charges BEFORE the disputed one, de-duplicated, and
+    # checked against the dispute table. Each step is isolated so a data hiccup never blocks the package.
+    disputed_ts = _to_unix(invoice_created) or _to_unix(dispute.get("created_at"))
+    disputed_charge_id = dispute.get("charge_id") or ((invoices or {}).get("charge"))
+    ident, consent = None, None
+    history_all = []
+    try:
+        history_all = get_charge_history(dispute.get("customer_id", ""), customer_email, limit=12,
+                                         before_ts=disputed_ts, exclude_charge=disputed_charge_id)
+        _log("got charge history: " + str(len(history_all)))
+    except Exception as _e:
+        _log("charge history failed: " + str(_e)[:200])
+    try:
+        window_pool = []
+        if disputed_ts:
+            window_pool = get_charge_history(dispute.get("customer_id", ""), customer_email, limit=12,
+                                             before_ts=disputed_ts - WINDOW_MIN_DAYS * 86400,
+                                             after_ts=disputed_ts - 365 * 86400,
+                                             exclude_charge=disputed_charge_id)
+        ident = build_identity_evidence(dispute, user, disputed_charge_id, window_pool + history_all, disputed_ts)
+        _log("identity evidence: " + (str(len(ident["priors"])) + " priors" if ident else "unavailable"))
+    except Exception as _e:
+        _log("identity evidence failed: " + str(_e)[:200])
+    try:
+        charge_history = drop_disputed_charges(history_all)
+        _log("charge history after dispute filter: " + str(len(charge_history)))
+    except Exception as _e:
+        charge_history = []  # if disputes cannot be checked, show no history rather than unverified history
+        _log("dispute filter failed: " + str(_e)[:200])
+    try:
+        consent = get_consent_timeline(dispute, user, disputed_loc_resolved or disputed_loc, plan_history, disputed_ts)
+    except Exception as _e:
+        _log("consent timeline failed: " + str(_e)[:200])
 
     # For verdict: use resolved location if available. If not resolved from invoice metadata,
     # fall back to the inferred location (disputed_loc) ONLY when the archived_at is clearly
@@ -1861,7 +2290,7 @@ def _build_package_inner(dispute_id):
     # so the operator is always prompted to accept, not contest.
     if is_fraud_closed:
         verdict = "REFUND_OWED"
-    signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history)
+    signals = evaluate_signals(dispute, user, loc, act_summary, active_dates, last_active, charge_history, ident=ident)
     product = detect_disputed_product(invoices)
     charge_is_payroll = is_payroll_invoice(invoices) or product["product_type"] == "payroll"
     slug = dispute_id.replace("_","-")
@@ -1871,7 +2300,8 @@ def _build_package_inner(dispute_id):
     pdf2 = pdf_receipt(dispute, invoices, same_day_invoices,
                        active_loc_count=len([l for l in all_locs if not l.get("archived_at")]))
     _log("building PDF 3")
-    pdf3 = pdf_service_docs(dispute, user, loc, plan_history, all_locations, disputed_loc=disputed_loc_resolved)
+    pdf3 = pdf_service_docs(dispute, user, loc, plan_history, all_locations, disputed_loc=disputed_loc_resolved,
+                            ident=ident, consent=consent)
     _log("building PDF 4")
     pdf4 = pdf_policy(dispute, loc)
     _log("all PDFs built")
@@ -1883,6 +2313,7 @@ def _build_package_inner(dispute_id):
     }
     pkg["_signals"]               = signals
     pkg["_verdict"]               = verdict
+    pkg["_identity"]              = ident
     pkg["_charge_is_payroll"]     = charge_is_payroll
     pkg["_downgrade_within_window"] = downgrade_within_window
     pkg["_archived_at"]           = downgrade_date if downgrade_within_window else ((fmt(disputed_loc.get("archived_at")) if disputed_loc else None) or "--")
@@ -2137,6 +2568,7 @@ def on_generate(n_clicks, dispute_id):
             sig_col = "#065f46" if strength == "strong" else ("#92400e" if strength == "moderate" else "#991b1b")
             sig_lbl = get_strength_badge(sig)
 
+            ident_text = identity_summary_text(pdfs.get("_identity"))
             warning_items = []
             for w in warnings:
                 if w == "no_activity":
@@ -2148,6 +2580,9 @@ def on_generate(n_clicks, dispute_id):
                     warning_items.append(html.Li(gap + "-day gap between last activity and charge date", style={"color":"#92400e"}))
                 elif w == "visa_132_risk":
                     warning_items.append(html.Li("Visa 13.2 risk -- check Salesforce for phone cancellation attempts before filing", style={"color":"#991b1b","fontWeight":"600"}))
+                elif w.startswith("identity_thin_"):
+                    _n_ids, _n_pr = (w.replace("identity_thin_", "").split("_") + ["0", "0"])[:2]
+                    warning_items.append(html.Li("Thin identity evidence -- " + _n_ids + " identifier(s) matched across " + _n_pr + " prior undisputed charge(s); issuers have been asking for 3+", style={"color":"#92400e"}))
 
             status = html.Div([
                 html.Div([
@@ -2159,6 +2594,7 @@ def on_generate(n_clicks, dispute_id):
                     html.Span(sig_lbl, style={"fontSize":"12px","color":sig_col,"fontWeight":"700"}),
                 ], style={"marginTop":"6px"}),
                 html.Ul(warning_items, style={"marginTop":"6px","marginBottom":"0","paddingLeft":"20px","fontSize":"12px"}) if warning_items else None,
+                html.Div(ident_text, style={"marginTop":"8px","fontSize":"12px","color":"#374151"}),
             admin_link,
             location_link,
             ], style={"background":sig_bg,"border":"1px solid " + sig_bdr,
