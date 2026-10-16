@@ -467,6 +467,15 @@ def _norm_phone(p):
     d = re.sub(r"\D", "", str(p or ""))
     return d[-10:] if len(d) >= 10 else d
 
+def _fmt_phone(p):
+    """Display a phone number as (XXX) XXX-XXXX when it is a 10-digit US number; otherwise as stored."""
+    d = re.sub(r"\D", "", str(p or ""))
+    if len(d) == 11 and d.startswith("1"):
+        d = d[1:]
+    if len(d) == 10:
+        return "(" + d[:3] + ") " + d[3:6] + "-" + d[6:]
+    return str(p or "").strip()
+
 def _norm_email(e):
     e = str(e or "").strip().lower()
     return e[len("invalid_"):] if e.startswith("invalid_") else e
@@ -636,6 +645,8 @@ def build_identity_evidence(dispute, user, disputed_charge_id, candidate_invoice
         "stripe_email": cust.get("email") or disputed.get("email"),
         "stripe_customer": cust_id,
         "phone_user":   bool(phone_u),
+        "phone_user_raw":   u.get("phone"),
+        "phone_stripe_raw": disputed.get("phone") or cust.get("phone"),
         "phone_stripe": bool(phone_s),
         "phone_match":  bool(phone_u and phone_s and phone_u == phone_s),
         "ip":           _public_ip(u.get("last_sign_in_ip")),
@@ -1133,9 +1144,10 @@ def identity_section(s, ident, consent=None):
             acct_rows.append(("Login Email vs Billing Email",
                               _x(str(acct["stripe_email"])) + (" (match)" if same else " (differs)")))
         if acct.get("phone_match"):
-            acct_rows.append(("Telephone", "Phone number on the Homebase account matches the billing record"))
+            acct_rows.append(("Telephone", "Homebase account: " + _x(_fmt_phone(acct.get("phone_user_raw"))) +
+                              "<br/>Billing record: " + _x(_fmt_phone(acct.get("phone_stripe_raw"))) + " (match)"))
         elif acct.get("phone_user"):
-            acct_rows.append(("Telephone", "Phone number on file with Homebase"))
+            acct_rows.append(("Telephone", "Homebase account: " + _x(_fmt_phone(acct.get("phone_user_raw")))))
         if acct.get("ip") and acct.get("ip_at"):
             acct_rows.append(("Last Recorded Sign-In", fmt(acct["ip_at"]) + " from IP " + _x(str(acct["ip"]))))
         if acct.get("device") and acct.get("device_at"):
