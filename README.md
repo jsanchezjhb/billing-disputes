@@ -1,56 +1,179 @@
-# billing-disputes
+# Billing Disputes Evidence Package
 
-Databricks App that generates a complete Stripe chargeback evidence package for Homebase billing disputes.
+A Databricks App (Dash / Python) that builds a Stripe chargeback evidence package for Homebase billing disputes.
 
-## What it does
+Enter a Stripe dispute ID and the app pulls everything it needs from internal tables, decides whether the dispute should be **contested or accepted**, and generates **four labeled PDFs** ready to upload to Stripe's evidence form. No Stripe API calls and no secret keys are used: everything comes from the database.
 
-1. Enter a Stripe dispute ID in the UI
-2. Looks up the dispute from `prod_redshift_replica.stripe.i_charge_dispute`
-3. Resolves the customer email to an internal Homebase account
-4. Queries location status, activity logs, and plan history from the DB
-5. Generates 5 labeled PDFs ready to upload directly to Stripe's evidence form
+---
 
-No Stripe API calls. No secret keys. Everything comes from the database.
+## How it works
+
+```
+dispute_id
+  -> stripe.i_charge_dispute        amount, reason, customer, charge_id, due date
+  -> stripe.invoice                 exact invoice via charge_id (fallback: customer + amount + date)
+  -> invoice line items             disputed location_id + what product was billed
+  -> public.users                   owner by email (invalid_ prefix fallback for fraud-closed accounts)
+  -> public.locations               all company locations (disputed one resolved from the invoice)
+  -> public.upgrades_downgrades     plan change history
+  -> public.companies               company name
+  -> public.fact_locations_by_day   activity for the disputed location only
+  -> verdict + case-strength signals
+  -> 4 PDFs + on-screen guidance
+```
+
+**Why `charge_id`:** multiple locations can be billed the same amount on the same day, so matching on customer + amount picks the wrong invoice for multi-location accounts. `charge_id` is the only 1:1 link between a dispute and an invoice. The invoice's subscription line (`metadata.location_id`) then identifies which location was actually billed.
+
+---
 
 ## Output PDFs
 
-| File | Stripe Upload Category |
+| File | Stripe upload category | Contents |
+|---|---|---|
+| `{id}_1_dispute_narrative.pdf` | Other | Verdict banner, reason-specific dispute statement, account summary, platform activity logs for the disputed location, prior charge history |
+| `{id}_2_dispute_receipt.pdf` | Receipt | Dispute summary and matched invoice. For duplicate disputes on multi-location accounts, every same-window invoice is shown as "Transaction Receipt N of M" |
+| `{id}_3_service_documentation.pdf` | Service documentation | Disputed-location callout, all locations table, owner sign-in history, plan change history |
+| `{id}_4_refund_cancellation_policy.pdf` | Refund and cancellation policy | Written policy, cancellation screenshots, and Terms of Service acceptance screenshots (web and mobile signup) |
+
+The UI offers each PDF individually plus a ZIP of all four.
+
+---
+
+## Verdict logic
+
+The reference date is the **invoice's `created` date** (the actual charge date), not the dispute filing date. The verdict depends only on the **disputed location's** `archived_at`; other locations on the account are irrelevant. This applies to every dispute reason, including fraud-coded disputes.
+
+| Situation | Verdict | Action |
+|---|---|---|
+| Disputed location never canceled (`archived_at` is null) | `NEVER_CANCELED` | Contest |
+| Canceled more than 30 days after the charge | `CANCELED_AFTER_PERIOD` | Contest (outside refund window) |
+| Canceled 0-30 days after the charge | `REFUND_OWED` | **Accept** |
+| Canceled before the charge date | `REFUND_OWED` | **Accept** |
+| Account closed by Homebase for fraud (`invalid_` email prefix) | `REFUND_OWED` (forced) | **Accept** |
+
+Notes:
+
+- Merchant-initiated closures (for example fraud shutdowns) count as cancellations for the refund policy.
+- A downgrade is **not** a cancellation. The customer used the paid tier through the billing period.
+- If the disputed location can't be resolved from the invoice, `archived_at` is only inferred from the fallback location when it is clearly more than 30 days either side of the charge. `REFUND_OWED` is never inferred from an unresolved location.
+
+### Fraud-closed accounts
+
+When Homebase closes an account for fraud, the email in `public.users` is prefixed with `invalid_` while Stripe keeps the original. The app retries the lookup with the prefix, flags the account as fraud-closed, shows a distinct banner, and does not show a downgrade alert.
+
+---
+
+## What the UI shows
+
+After generating a package the app always shows admin links for the company and the disputed location, and one of:
+
+- **ACCEPT THIS DISPUTE** (`REFUND_OWED`): cancellation date, policy rationale, and "do not file evidence."
+- **FRAUD-CLOSED ACCOUNT**: accept in Stripe; no package is generated if no location exists.
+- **Case strength badge** (contest cases): strong / moderate / challenging, with warning bullets.
+
+Conditional callouts:
+
+| Callout | Fires when |
 |---|---|
-| `{id}_1_dispute_narrative.pdf` | Other (paste into rebuttal text field) |
-| `{id}_2_dispute_receipt.pdf` | Receipt |
-| `{id}_3_service_documentation.pdf` | Service documentation |
-| `{id}_4_customer_activity_logs.pdf` | Customer communication |
-| `{id}_5_refund_cancellation_policy.pdf` | Refund and cancellation policy |
+| Locations requiring downgrade | The disputed location is not canceled, is above Tier 1, and the charge is for a core product |
+| Payroll charge, customer contact required | The disputed invoice contains a payroll line. Downgrade alert is suppressed; the offboarding call must happen first |
+| Hiring Assistant / non-core product charge | The invoice bills a non-core product. Downgrade logic does not apply; verify eligibility for that product |
+| Manual review required | Duplicate dispute on a single-location account |
 
-## Database Tables Used
+### Product detection
 
-| Table | Purpose |
+`detect_disputed_product()` inspects the invoice line items and classifies the charge as `core`, `payroll`, `hiring`, `other`, or `unknown`. Core means Essentials, Plus, or All-in-One. Tax, discount, coupon, proration, and rounding lines, and any line with an amount of zero or less, are ignored. If an invoice mixes products, any non-core product takes priority over core lines.
+
+### Case strength signals (UI only, never in the PDFs)
+
+| Signal | Rule |
 |---|---|
-| `prod_redshift_replica.stripe.i_charge_dispute` | Dispute details (amount, reason, due date, customer email) |
-| `prod_redshift_replica.public.users` | Resolve email to user_id |
-| `prod_redshift_replica.public.locations` | Location status, archived_at, active_now |
-| `prod_redshift_replica.public.upgrades_downgrades` | Subscription/plan change history |
-| `prod_redshift_replica.public.fact_locations_by_day` | Daily activity logs |
+| No activity | 0 active days for the disputed location |
+| Low activity | 5 or fewer active days |
+| Recency gap | More than 60 days between last activity and the charge |
+| Visa 13.2 risk | `subscription_canceled` dispute combined with any of the above |
+| Strength | 0 warnings = strong, 1 = moderate, 2 or more = challenging |
 
-## Databricks App Setup
+Visa 13.2 (cancelled recurring transaction) can't be checked automatically. Look in Salesforce for phone or verbal cancellation attempts before filing.
 
-1. Connect this GitHub repo in the Databricks App configuration
-2. Add your SQL Warehouse as an app resource
-3. Set instance size to Medium (2 vCPU, 6 GB) -- no other configuration needed
-4. Deploy
+---
 
-The app uses DATABRICKS_TOKEN from the environment automatically -- no manual secrets setup required.
+## Special cases
 
-## Files
+- **Duplicate disputes:** on accounts with 2 or more active locations, all invoices in a +/-3 day window are shown as separate receipts with a per-location billing explanation. On single-location accounts the package is flagged for manual review, because the duplicate claim may be legitimate.
+- **Payroll charges:** payroll can't be self-offboarded. Reps must call the customer before accepting or filing.
+- **Fraudulent / unrecognized disputes:** include prior successful charge history and sign-in IP/device details.
 
-- `app.py` -- main Dash application
-- `requirements.txt` -- Python dependencies (dash, databricks-sql-connector, reportlab)
+---
 
-## Refund & Cancellation Policy
+## Database tables
 
-Per Homebase policy (baked into the generated PDFs):
+| Table | Used for |
+|---|---|
+| `prod_redshift_replica.stripe.i_charge_dispute` | Dispute details, including `charge_id` |
+| `prod_redshift_replica.stripe.invoice` | Matched invoice, line items, charge history |
+| `prod_redshift_replica.public.users` | Owner lookup, sign-in counts, IP, device |
+| `prod_redshift_replica.public.locations` | Location status, tier, `archived_at` |
+| `prod_redshift_replica.public.upgrades_downgrades` | Plan change history |
+| `prod_redshift_replica.public.fact_locations_by_day` | Daily activity per location |
+| `prod_redshift_replica.public.companies` | Company name (`company_id` is the key, not `id`) |
+| `prod_redshift_replica.public.payroll_setup_infos` | Defined in config; not currently queried |
 
-- 30-day full refund window from each charge date (not signup date)
-- Applies to both monthly and annual plans
-- No prorated refunds under any circumstances
-- Cancellation must be completed in-app: Settings > Billing & Plan > Cancel Subscription
+### Query rules (these exist because of timeouts and engine quirks)
+
+- Keep every query tightly filtered. Unbounded scans of `stripe.invoice` or `fact_locations_by_day` time out. Use `charge_id`, a date window, or a single `location_id`.
+- `fact_locations_by_day` has no `company_id`. Resolve the location first, then query one `location_id`.
+- `LIMIT` must be inlined as an integer; Databricks rejects a parameterized `LIMIT`.
+- `stripe.invoice` amounts are in **cents**; `created`, `period_start`, and `period_end` are **Unix timestamps**.
+- `users.first_name` / `last_name` can be null.
+- The company-name lookup uses its own 8-second-timeout connection so a slow `companies` table never blocks the build.
+- Don't use `with get_conn() as conn:`. The connection context manager closes the connection on exit. `build_package` opens one connection and closes it in `finally`.
+
+---
+
+## Setup and deployment
+
+1. Connect this repo in the Databricks App configuration.
+2. Add a SQL warehouse as an app resource. Set the HTTP path in `DATABRICKS_HTTP_PATH` in `app.py`. Use an auto-stop long enough to avoid cold-start timeouts on the first request (the app also sends a background `SELECT 1` at startup to wake it).
+3. Authentication is automatic through Databricks Apps OAuth (`databricks.sdk.core.Config`). No token or secret needs to be set.
+4. The port comes from `DATABRICKS_APP_PORT` (default 8050).
+5. Deploy. **After every change to `app.py`, redeploy and confirm the live app is running the new version.** A stale deployment has caused "the fix didn't work" reports before.
+
+### Files
+
+| File | Purpose |
+|---|---|
+| `app.py` | The whole application (Dash UI, queries, verdict logic, PDF generation) |
+| `requirements.txt` | `dash==2.17.1`, `databricks-sql-connector==3.1.0`, `databricks-sdk==0.20.0`, `reportlab==4.1.0` |
+| `termination_step_1.png`, `termination_step_2.png` | Cancellation screenshots (embedded into `app.py` as base64 JPEG) |
+
+`app.py` also uses Pillow, which is installed with ReportLab.
+
+---
+
+## Refund and cancellation policy (as stated in the PDFs)
+
+- 30-day full refund window, counted from **each individual charge date** (not signup).
+- Applies to monthly and annual plans. No prorated refunds.
+- Cancellation must be done in the app by the account owner; Homebase does not accept cancellations by phone or email.
+
+---
+
+## Development notes
+
+- **File size:** `app.py` embeds four JPEGs as base64 and is about 366KB. Past experience says Databricks may fail to parse it silently if it grows much past ~400KB. Keep additions small, or move the images out.
+- **Dash callbacks:** duplicate component IDs silently kill every callback. Check with `grep -o 'id="[^"]*"' app.py | sort | uniq -d`. The download buttons live in the static layout (hidden until a package exists) and are never injected from a callback; the download callbacks need `allow_duplicate=True`.
+- **Before shipping a change:** parse the file (`python -c "import ast; ast.parse(open('app.py').read())"`) and test against a real dispute ID for each verdict path.
+
+---
+
+## Known issues
+
+- The policy text says "Settings > Billing & Plan > Cancel Subscription," but the embedded screenshots show **Plan & billing > Delete company > Cancel Account**. The screenshots also say all locations are deactivated immediately. Align the policy text and screenshots with the current product.
+- The policy PDF's closing box reads the owner's primary location, not the disputed one, and always says the customer "has never canceled" for non-fraud reasons. It can contradict the narrative on `CANCELED_AFTER_PERIOD` disputes.
+- "Prior Successful Charge History" has no upper date bound, so it can include the disputed invoice and later invoices.
+- Activity totals are lifetime for the disputed location, but several narratives describe them as "during the disputed period."
+- The recency-gap signal measures from the dispute filing date, not the invoice date.
+- The 4th PDF's section badge reads "5." and `get_payroll...` has lost its `def` line (dead code after `get_activity_for_location`).
+- Company queries cap locations at 100 (active first); very large accounts may miss some.
+- If `charge_id` is null on the dispute, invoice matching falls back to customer + amount + date, which can still be ambiguous.
